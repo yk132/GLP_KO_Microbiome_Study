@@ -1,0 +1,562 @@
+---
+title: "Full Dataset: Decontam and Tree"
+author: "Eva Kim"
+date: "10/13/2023"
+output: 
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(getClass.msg=FALSE) # Suppress messages about class phyloseq being found in two packages
+```
+
+Now that the reads have gone through the DADA2 pipeline, we can start analyzing. 
+
+# Load libraries and directories
+
+```{r, results = 'hide', warning=FALSE, message=FALSE}
+library(readr)
+library(stringr)
+library(dplyr)
+library(tibble)
+library(magrittr)
+library(phyloseq)
+library(ggplot2)
+library(fs)
+library(tidyr)
+library(tidyverse)
+library(decontam)
+library(microbiome)
+library(ggrepel)
+library(DT)
+library(plotly)
+library(ape)
+library(picante)
+library(DECIPHER)
+library(fs)
+library(phytools)
+library(colorBlindness)
+```
+
+```{r}
+rm(list=ls()) # clear environment 
+
+work.dir = file.path("/work/yk132/") # Path to storage directory
+git.dir = file.path("~/storage/GLP_KO_Microbiome_Study/") # Path to Git directory 
+
+ps.rds <- file.path(git.dir, "Large_run_w_blanks.rds")
+ps <- read_rds(ps.rds)
+ps
+
+ps.Run1.rds <- file.path(git.dir, "LT.subset.rds")
+ps.Run1 <- read_rds(ps.Run1.rds)
+
+map.file = file.path("Metadata.csv")
+meta.df = read_csv(map.file, show_col_types = FALSE)
+
+Run1.file = file.path("08_SampleReturn_Gunsch.csv")
+Run1.df = read_csv(Run1.file, show_col_types = FALSE)
+
+Run2.file = file.path("08_SampleReturn_Gunsch20230502_T01_31Jan20231.csv")
+Run2.df = read_csv(Run2.file, show_col_types = FALSE)
+
+fecal.file = file.path(git.dir, "Fecal_submissions.csv")
+fecal.df = read_csv(fecal.file, show_col_types = FALSE)
+```
+
+Note that we had 6 lung tissue samples that were submitted as a part of another run ("Run 1") and another run with all the fecal and lung tissue samples ("Full Run"). 
+
+Directories for building a phylogenetic tree: 
+
+```{r}
+scratch.dir = path.expand(file.path(work.dir, paste0("scratch")))
+if (dir_exists(scratch.dir)) {
+  dir_delete(scratch.dir)
+}
+dir_create(scratch.dir)
+
+Sys.setenv(SCRATCH_DIR = scratch.dir)
+```
+
+```{r}
+ps
+ps.Run1
+
+subset_taxa(ps, Kingdom == "Bacteria") -> ps # remove non-bacterial taxa
+subset_taxa(ps.Run1, Kingdom == "Bacteria") -> ps.Run1 # remove non-bacterial taxa
+
+ps
+ps.Run1
+```
+
+# Update Metadata for Run 1 
+
+The metadata tables have been merged multiple times with other data frames to encompass the host health data.
+
+
+```{r}
+meta.df %>% filter(Sequencing_Run == "1") -> meta.Run1
+
+# change sample names that don't match between Run1 library prep csv file and metadata
+Run1.df$`Sample Name`[Run1.df$`Sample Name` == "PCR-neg1"] <- "PCR-neg1-eva"
+Run1.df$`Sample Name`[Run1.df$`Sample Name` == "zymo"] <- "zymo-eva"
+all(Run1.df$`Sample Name` %in% meta.Run1$Label)
+
+Run1.df %>% dplyr::select(c("Sample Name", "QuBit ng/ul")) %>% 
+  dplyr::rename(Label = "Sample Name")%>% right_join(meta.Run1, by = "Label") %>% 
+  column_to_rownames("Label") -> meta.Qubit.Run1
+ 
+meta.Qubit.Run1 %>% select(-`Concentration-(ng/uL)`) %>%
+  dplyr::rename("Concentration-(ng/uL)" = "QuBit ng/ul") -> meta.Qubit.Run1
+
+phyloseq::sample_data(ps.Run1) <- phyloseq::sample_data(meta.Qubit.Run1)
+```
+
+
+# Decontam
+
+Since we have data from two separate runs, we will run `decontam` separately for each `phyloseq` object and merge them at the end. Moreover, fecal and lung tissue samples were prepared in different ways using different kits and by different personnel in different labs. As such, we should run `decontam` by sample type to remove sample type-specific contaminating taxa. This may not get rid of all the contaminating taxa that come from the actual sequencing; as such, a final `decontam` will be run with the merged clean `phyloseq` objects. 
+
+
+This run of `decontam` contains all procedural blanks including PCR and diluting water blanks for fecal samples (fecal DNA was too high, so input DNA into PCR was diluted as necessary).  
+
+## Run 1 
+
+Number of reads:
+
+```{r}
+df <- as.data.frame(sample_data(ps.Run1)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps.Run1)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+df %>% rownames_to_column("Sample") -> df
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Type, tooltip = Sample)) + geom_point() + theme_bw() -> p
+ggplotly(p, tooltip = c("Sample"))
+```
+Let's look at number of non-zero ASVs per sample: 
+
+```{r}
+otu_table(ps.Run1) %>% as.data.frame() -> df_otu
+df_otu$ASV_Sums <- rowSums(df_otu != 0)
+df_otu %>% rownames_to_column("Sample") %>% left_join(df, by = "Sample") -> df_otu
+df_otu <- df_otu[order(df_otu$ASV_Sums),]
+df_otu$otu_index <- seq(nrow(df_otu))
+ggplot(data=df_otu, aes(x=otu_index, y=ASV_Sums, color=Type, tooltip = Sample)) + geom_point() + theme_bw() -> p2
+ggplotly(p2, tooltip = c("Sample"))
+```
+
+The samples, in general, have a low number of ASVs. 
+
+While the number of reads for some samples aren't too different from negative controls, it is good that samples at least seem to have a higher number of ASVs present.
+
+I propose using decontam with both the prevalence and frequency-based contamination identification since the Qubit data after library preparation is available from DMC, though it needs to be merged with the metadata file. 
+
+I am removing contaminants that have been identified by either frequency or prevalence method. The threshold for frequency is 0.1, whereas that of prevalence method is 0.5 (i.e., reads are identified as contaminants if they are more prevalent in negative controls vs. the actual samples). For more information on `decontam` package, please refer to [this vignette](https://benjjneb.github.io/decontam/vignettes/decontam_intro.html). 
+
+
+```{r}
+sample_data(ps.Run1)$is.neg <- sample_data(ps.Run1)$Type == "Neg Control"
+ps.contam <- isContaminant(ps.Run1, method = "either",  neg = "is.neg", conc = "Concentration..ng.uL.", threshold = c(0.1, 0.5)) # for frequency, the threshold order is frequency test then prevalence test. Using 0.5 for prevalence
+table(ps.contam$contaminant)
+```
+
+```{r}
+ps.contam %>% filter(contaminant == TRUE) %>% arrange(desc(freq))
+```
+
+Let's check this with the ASV taxonomic table: 
+
+```{r}
+ps.Run1@tax_table["ASV4"]
+ps.Run1@tax_table["ASV30"]
+ps.Run1@tax_table["ASV40"]
+ps.Run1@tax_table["ASV58"]
+ps.Run1@tax_table["ASV66"]
+```
+
+```{r}
+ps.Run1.clean <- prune_taxa(!ps.contam$contaminant, ps.Run1)
+ps.Run1.clean
+```
+
+Now, I'll graph the number of reads / ASVs per sample as before, but after `decontam`: 
+
+```{r}
+df <- as.data.frame(sample_data(ps.Run1.clean)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps.Run1.clean)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+df %>% rownames_to_column("Sample") -> df
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Type, tooltip = Sample)) + geom_point() + theme_bw() -> p
+ggplotly(p, tooltip = c("Sample"))
+
+
+otu_table(ps.Run1.clean) %>% as.data.frame() -> df_otu
+df_otu$ASV_Sums <- rowSums(df_otu != 0)
+df_otu %>% rownames_to_column("Sample") %>% left_join(df, by = "Sample") -> df_otu
+df_otu <- df_otu[order(df_otu$ASV_Sums),]
+df_otu$otu_index <- seq(nrow(df_otu))
+ggplot(data=df_otu, aes(x=otu_index, y=ASV_Sums, color=Type, tooltip = Sample)) + geom_point() + theme_bw() -> p2
+ggplotly(p2, tooltip = c("Sample"))
+```
+
+Since we only removed 5 taxa, they aren't too different before and after. 
+
+
+## Full Run 
+
+Let's repeat the process with the full run. 
+
+```{r}
+df <- as.data.frame(sample_data(ps)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+rownames(df) -> tmp
+df$Sample <- tmp
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Type, tooltip = Sample)) + geom_point() + facet_wrap(~Sample_type)+ theme_bw()  -> p
+ggplotly(p, tooltip = c("Sample"))
+
+otu_table(ps) %>% as.data.frame() -> df_otu
+df_otu$ASV_Sums <- rowSums(df_otu != 0)
+rownames(df_otu) -> tmp
+df_otu$Sample <- tmp
+df_otu %>% left_join(df, by = "Sample") -> df_otu
+df_otu <- df_otu[order(df_otu$ASV_Sums),]
+df_otu$otu_index <- seq(nrow(df_otu))
+ggplot(data=df_otu, aes(x=otu_index, y=ASV_Sums, color=Type, tooltip = Sample)) + geom_point() + facet_wrap(~Sample_type)+ theme_bw()  -> p2
+ggplotly(p2, tooltip = c("Sample"))
+
+```
+
+It is at least comforting that samples seem to have much more ASV's than negative controls in general. 
+
+```{r}
+meta.df %>% dplyr::filter(Sequencing_Run == "2") -> meta.Run2
+meta.Run2 %>% select(-c("Concentration-(ng/uL)")) -> meta.Run2
+Run2.df %>% dplyr::select(c("Sample Name", "QuBit ng/ul")) %>% dplyr::rename(Label = "Sample Name", "Concentration-(ng/uL)" = "QuBit ng/ul") -> Run2.df.merge
+fecal.df %>% dplyr::select(c("Sample-Index", "Concentration-(ng/uL)")) %>% dplyr::rename(Label = "Sample-Index") %>% rbind(Run2.df.merge) -> Run2.Qubit
+Run2.Qubit %>% filter(is.na(Label) != TRUE) -> Run2.Qubit
+
+all(Run2.Qubit$Label %in% meta.Run2$Label)
+```
+
+This is due to some samples not surviving the DADA2 process. 
+
+```{r}
+Run2.Qubit %>% filter(Label %in% rownames(ps@sam_data)) -> Run2.Qubit
+all(Run2.Qubit$Label %in% meta.Run2$Label)
+```
+
+
+```{r, echo=T}
+Run2.Qubit %>% right_join(meta.Run2, by = "Label") %>% column_to_rownames("Label") -> meta.Qubit.Run2
+sample_data(ps) <- sample_data(meta.Qubit.Run2)
+```
+
+# Decontam By Sample Type
+
+Fecal and lung tissue samples were prepared in different ways using different kits. Furthermore, lung tissue samples were prepared by DMC, whereas fecal samples were prepared in-house. As such, we should run `decontam` by sample type to remove sample type-specific contaminating taxa. This may not get rid of all the contaminating taxa that come from the actual sequencing; as such, a final `decontam` will be run with the merged clean `phyloseq` objects. 
+
+```{r}
+ps
+ps.Run1.clean
+merge_phyloseq(ps, ps.Run1.clean) -> ps.merge
+ps.merge
+```
+
+
+```{r}
+ps.merge %>% subset_samples(Sample_type == "Fecal") -> ps.Fecal
+ps.merge %>% subset_samples(Sample_type == "Lung Tissue") -> ps.LT
+```
+
+```{r, echo=T}
+sample_data(ps.Fecal)$is.neg <- sample_data(ps.Fecal)$Type == "Neg Control"
+ps.Fecal.contam <- isContaminant(ps.Fecal, method = "either",  neg = "is.neg", conc = "Concentration..ng.uL.", threshold = c(0.1, 0.5)) # for frequency, the threshold order is frequency test then prevalence test. Using 0.5 for prevalence
+table(ps.Fecal.contam$contaminant)
+```
+
+```{r}
+ps.Fecal.contam %>% filter(contaminant == TRUE) %>% arrange(desc(freq))
+```
+
+```{r}
+ps.Fecal@tax_table["ASV1971"]
+ps.Fecal@tax_table["ASV1182"]
+ps.Fecal@tax_table["ASV1479"]
+ps.Fecal@tax_table["ASV1514"]
+ps.Fecal@tax_table["ASV1014"]
+```
+
+```{r}
+ps.Fecal.clean <- prune_taxa(!ps.Fecal.contam$contaminant, ps.Fecal)
+ps.Fecal
+ps.Fecal.clean
+```
+
+
+
+```{r, echo=T}
+sample_data(ps.LT)$is.neg <- sample_data(ps.LT)$Type == "Neg Control"
+ps.LT.contam <- isContaminant(ps.LT, method = "either",  neg = "is.neg", conc = "Concentration..ng.uL.", threshold = c(0.1, 0.5)) # for frequency, the threshold order is frequency test then prevalence test. Using 0.5 for prevalence
+table(ps.LT.contam$contaminant)
+```
+
+```{r}
+ps.LT.contam %>% filter(contaminant == TRUE) %>% arrange(desc(freq))
+```
+
+```{r}
+ps.LT@tax_table["ASV71"]
+ps.LT@tax_table["ASV49"]
+ps.LT@tax_table["ASV75"]
+ps.LT@tax_table["ASV58"]
+ps.LT@tax_table["ASV117"]
+```
+
+```{r}
+ps.LT.clean <- prune_taxa(!ps.LT.contam$contaminant, ps.LT)
+ps.LT
+ps.LT.clean
+```
+
+And now merge the phyloseq objects again:
+
+```{r}
+ps.merge
+ps.Fecal.clean
+ps.LT.clean
+merge_phyloseq(ps.Fecal.clean, ps.LT.clean) -> ps.clean
+ps.clean
+```
+
+Graph after `decontam`: 
+
+```{r}
+df <- as.data.frame(sample_data(ps.clean)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps.clean)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+rownames(df) -> tmp
+df$Sample <- tmp
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Type, tooltip = Sample)) + geom_point() + facet_wrap(~Sample_type)+ theme_bw()  -> p
+ggplotly(p, tooltip = c("Sample"))
+
+otu_table(ps.clean) %>% as.data.frame() -> df_otu
+df_otu$ASV_Sums <- rowSums(df_otu != 0)
+rownames(df_otu) -> tmp
+df_otu$Sample <- tmp
+df_otu %>% left_join(df, by = "Sample") -> df_otu
+df_otu <- df_otu[order(df_otu$ASV_Sums),]
+df_otu$otu_index <- seq(nrow(df_otu))
+ggplot(data=df_otu, aes(x=otu_index, y=ASV_Sums, color=Type, tooltip = Sample)) + geom_point() + facet_wrap(~Sample_type)+ theme_bw()  -> p2
+ggplotly(p2, tooltip = c("Sample"))
+
+```
+
+
+And let's remove the positive  control: 
+
+```{r}
+ps.clean
+ps.clean %>% subset_samples(Type != "Pos Control") -> ps.clean.sam
+ps.clean.sam
+```
+
+
+# Remove samples with low number of reads
+
+I will prune before building the phylogenetic tree; as a general rule of thumb, I prefer doing analyses on samples with > 1000 reads per sample. 
+
+```{r}
+sample_min_count = 1000
+
+which(sample_sums(ps.clean.sam) < sample_min_count) 
+which(sample_sums(ps.clean.sam) < sample_min_count) %>% length()
+```
+
+```{r}
+meta.df %>% filter(Sample_type == "Fecal" & Type == "Neg Control") %>% select(Label)
+```
+
+Many of these are blanks. 
+
+```{r}
+ps.clean.sam %>%
+  prune_samples(sample_sums(.)>=sample_min_count, .) ->
+  ps_filt
+
+ps_filt
+```
+
+```{r}
+ps_filt %>% subset_samples(Sample_type == "Lung Tissue" & Type == "True Sample")
+```
+
+```{r}
+ps_filt %>% subset_samples(Sample_type == "Fecal" & Type == "True Sample")
+```
+
+# What do blanks look like? 
+
+Even after running `decontam`, leftover contamination is still possible/probable. 
+Let's graph blanks to see what's left. For ease of analyses, aggregate at genus level. Although there are multiple ASVs after aggregating at the genus level, the rownames after `tax-glom` do not reflect that. As such, rename the rownames.
+
+```{r, warning=FALSE, message=FALSE}
+subset_samples(ps_filt, Type == "Neg Control") -> ps_blanks
+
+ps_blank_g <- tax_glom(ps_blanks, "Genus")
+taxa_names(ps_blank_g) <- tax_table(ps_blank_g)[, 'Genus'] 
+head(tax_table(ps_blank_g))
+
+ps_blanks
+ps_blank_g
+``` 
+
+For Kat: I'm going to continue with only lung tissue sample-associated blanks, especially since only one fecal blank survived the filtering step. 
+
+
+```{r, warning=FALSE, message=FALSE}
+ps_blank_g %>% subset_samples(Sample_type == "Lung Tissue") -> ps_blank_g_LT
+ps_blank_g_LT
+ps_blanks.ts <-  transform_sample_counts(ps_blank_g_LT, function(x) x/sum(x)) # Lung Tissue only!! 
+```
+
+
+```{r, message=FALSE, echo=T}
+sample_data(ps_blank_g_LT)$Sample.Name <- rownames(sample_data(ps_blank_g_LT))
+sample_data(ps_blanks.ts)$Sample.Name <- rownames(sample_data(ps_blanks.ts))
+```
+
+```{r}
+plot_bar(ps_blank_g_LT, x = "Sample.Name", fill="Phylum") + 
+  facet_grid(scales="free", space = "free_x", ~Sample_type) + 
+  geom_bar(aes(color=Phylum, fill=Phylum), stat="identity", position="stack") +  
+  theme_bw()  +   
+  labs(y="Absolute Abundance", title = "Absolute Abundance of Blanks for Lung Tissue Samples") +
+  scale_color_manual(values=SteppedSequential5Steps) + 
+  scale_fill_manual(values=SteppedSequential5Steps) +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) 
+```
+
+```{r}
+plot_bar(ps_blanks.ts,x = "Sample.Name", fill="Phylum") + 
+  facet_grid(scales="free", space = "free_x", ~Sample_type) + 
+  geom_bar(aes(color=Phylum, fill=Phylum), stat="identity", position="stack") +  
+  theme_bw()  +   
+  labs(y="Relative Abundance", title = "Relative Abundance of Blanks for Lung Tissue Samples") +
+  coord_cartesian(ylim = c(0,1), expand=0) + 
+  scale_color_manual(values=SteppedSequential5Steps) + 
+  scale_fill_manual(values=SteppedSequential5Steps) +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) -> p2
+p2
+
+```
+
+Let's graph the top 20 contaminating genera. 
+
+```{r}
+N <- 20
+top <- names(sort(taxa_sums(ps_blanks.ts), decreasing = TRUE))[1:N]
+
+# Subset object to top N taxa
+ps_blanks.ts.top <- prune_taxa(top, ps_blanks.ts)
+```
+
+```{r}
+rowSums(ps_blanks.ts.top@otu_table)
+```
+
+The top 20 genera encompass almost all of the relative abundance. 
+
+```{r}
+plot_bar(ps_blanks.ts.top,x = "Sample.Name", fill="Phylum") + 
+  facet_grid(scales="free", space = "free_x", ~Sample_type) + 
+  geom_bar(aes(color=Phylum, fill=Phylum), stat="identity", position="stack") +  
+  theme_bw()  +   
+  labs(y="Relative Abundance", title = "Relative Abundance of Blanks for Lung Tissue Samples, top 20, phylum") +
+  coord_cartesian(ylim = c(0,1), expand=0) + 
+  scale_color_manual(values=SteppedSequential5Steps) + 
+  scale_fill_manual(values=SteppedSequential5Steps) +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) -> p3
+p3
+```
+
+```{r}
+plot_bar(ps_blanks.ts.top,x = "Sample.Name", fill="Genus") + 
+  facet_grid(scales="free", space = "free_x", ~Sample_type) + 
+  geom_bar(aes(color=Genus, fill=Genus), stat="identity", position="stack") +  
+  theme_bw()  +   
+  labs(y="Relative Abundance", title = "Relative Abundance of Blanks for Lung Tissue Samples, top 20, genera") +
+  coord_cartesian(ylim = c(0,1), expand=0) + 
+  scale_color_manual(values=SteppedSequential5Steps) + 
+  scale_fill_manual(values=SteppedSequential5Steps) +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) -> p4
+p4
+
+```
+
+## Possibly Contaminating Taxa
+
+```{r}
+ps_blanks.ts@otu_table %>% as.data.frame() %>% select_if(colSums(.) != 0) %>%
+  apply(2, median) %>% as.data.frame() %>% arrange(desc(.))  %>%
+  dplyr::rename("Median Relative Abundance in Blanks" =".") %>%
+  rownames_to_column("Genus") -> blanks.taxa
+
+ps_blanks.ts@otu_table %>% as.data.frame() %>% select_if(colSums(.) != 0)  %>% t() %>% as.data.frame() %>%
+  rownames_to_column("Genus") %>%
+  right_join(blanks.taxa, by = "Genus") -> blanks.taxa
+
+blanks.taxa
+```
+
+
+```{r}
+write_csv(blanks.taxa, file.path(git.dir, "LT_contaminants.csv"), append = FALSE, col_names = TRUE)
+```
+
+
+# Build a phylogenetic tree
+
+Now that we have removed contaminants, we can start analyses. First, let's build a phylogenetic tree for distance-based beta diversity metrics. 
+
+### Align ASVs
+```{r}
+alignment <- AlignSeqs(ps_filt@refseq, anchor=NA, processors = NULL) # automatically detect & use available processors
+input.alignment <- file.path(scratch.dir, "input_alignment_filt.fasta")
+Sys.setenv(ALIGNED_ASV_FASTA=input.alignment)
+writeXStringSet(alignment, filepath = input.alignment, format = "fasta")
+```
+
+
+```{bash}
+set -u
+
+raxmlHPC-PTHREADS -s $ALIGNED_ASV_FASTA -m GTRGAMMAIX -f a -p 1234 -x 2345 -N 100 -n alignment_filt -T 24 -w $SCRATCH_DIR # code from Dr. Granek
+
+```
+
+```{r}
+tree <- read.tree(file.path(scratch.dir, "RAxML_bipartitions.alignment_filt"))
+str(tree)
+is.rooted(tree)
+rooted.tree <- phytools::midpoint.root(tree) # root for UniFrac
+class(rooted.tree)
+is.rooted(rooted.tree)
+ps.wtree <- merge_phyloseq(ps_filt, phy_tree(rooted.tree))
+ps.rds = file.path(git.dir, paste0("ps.clean.rerun.tree.rds")) # rerun to distinguish between previous one and this one w/all blanks
+write_rds(ps.wtree, ps.rds)
+loaded.ps = read_rds(ps.rds)
+print(loaded.ps)
+```
+
+
+# Reproducibility
+```{r}
+sessionInfo()
+```
+
