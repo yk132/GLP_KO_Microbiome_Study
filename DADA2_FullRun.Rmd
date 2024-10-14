@@ -1,0 +1,570 @@
+---
+title: "DADA2: Illumina Full Run"
+author: "Eva Kim"
+date: "10/12/2023"
+output: 
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Project Abstract
+
+Obesity increases asthma severity and diminishes responsiveness to asthma medications. Patients with obesity exhibit increased leptin and decreased glucagon-like peptide 1 (GLP-1) secretion. Bariatric surgery is an effective therapy for obesity that induces elevated circulating GLP-1 levels and improves asthma symptoms. Both gut and lung microbiomes exhibit dysbiosis in patients with asthma and obesity compared to lean, healthy patients. GLP-1 receptor (GLP1R) activation alters the gut microbiota of mice. Our data suggest that Glpr1 deficiency impacts airway resistance in a mouse model of allergic airways disease. **Our hypothesis is that increased GLP-1 secretion following bariatric surgery alters the gut and airway/lung microbiomes and that these alterations reduce airway inflammation and improve asthma control and lung function in patients with obesity.** We propose two Aims. In Aim 1, we will analyze microbial communities in bronchoalveolar lavage (BAL) fluid prior to and 12 months following bariatric surgery in patients with asthma and obesity. We will correlate these findings with leptin and GLP-1 levels in blood and BAL fluid and to clinical measures of lung function and asthma control. In Aim 2, diet-induced obese Glp1r-/- and Glp1r+/+ mice will be intranasally challenged with house dust mite allergen and undergo vertical sleeve gastrectomy. We will assess microbiota species in lung tissue and feces and relate these findings to GLP-1 and leptin levels in plasma and BAL fluid, lung mechanics and tissue pathology. In both aims, we will relate microbiome changes to lung function and inflammatory responses to predict asthma outcomes in patients with obesity. 
+
+This data pertains to Aim 2 of the project. As the lung tissue samples had low bacterial biomass and high host DNA contamination, 9 lung tissue samples were submitted first to test the applicability of the protocol (6 samples and 3 blanks; sequencing run 1). The rest of the lung tissue samples were sequenced on a different run along with all fecal samples (sequencing run 2). This R markdown file is for sequencing run #2 containing both fecal and lung tissue samples. Throughout code and comments, I use LT for lung tissue. 
+
+Please note that to use `ancom` function for identifying differentially abundant taxa, the package `ANCOMBC` has to be updated with the latest version of R.
+
+## Methods for Data Generation 
+
+### Lung Tissue
+DNA from whole lung tissue was extracted using with Qiagen Blood & Tissue kit as described in [*Baker et al., 2021*](https://microbiomejournal.biomedcentral.com/articles/10.1186/s40168-021-01055-4). DNA was quantified using Qubit 2.0 floufluorometer (ThermoFisher) and submitted to Duke Microbiome Center for library preparation using standard [Earth Microbiome Protocol](http://www.earthmicrobiome.org/) for 16S rRNA v4 region. For each sample, triplicate PCR reactions were performed, which were then merged for magnetic bead clean-up of prepared libraries. Equal mass of 16S rRNA PCR products was pooled from all samples for sequencing. The final pool was submitted to Duke Sequencing and Genomic Technology (SGT) core for sequencing. 
+
+
+### Fecal Samples
+
+Fecal samples were extracted with DNeasy PowerSoil Pro kits (QIAGEN). The extracted DNA was prepared for sequencing with v4 region primers (515F, 5'-GTGYCAGCMGCCGCGGTAA-3' and 806rB, 5'-GGACTACNVGGGTWTCTAAT-3'; same as above) with dual-indexed barcodes following Illumina's [16S metagenomic sequencing guidelines](https://support.illumina.com/documents/documentation/chemistry_documentation/16s/16s-metagenomic-library-prep-guide-15044223-b.pdf).The PCR used KAPA HiFi PCR kit (Roche). The concentrations following PCR were determined using a Qubit fluorometer (ThermoFisher), and equal mass if PCR products was pooled from all samples. The final fecal pool was submitted to the Duke SGT for sequencing. 
+
+### Sequencing
+Duke SGT performed quantitative PCR (qPCR) to determine the ideal input amount of fecal and lung tissue pools for even read depth distribution. The combined pool was then sequenced on Illumina's MiSeq platform with v2 chemistry (250 base pairs, paired-end). This data in particular was generated at Illumina, not SGT.  
+
+
+### Info for data analysis
+For the lung tissue samples, the barcode and primer sequences have been removed. However, for fecal samples both will have to be removed. For both, the region between 515F and 806R primers is about 254 bp. 
+
+### Database
+I'm using Silva version 138 with training data formatted for DADA2 from https://zenodo.org/record/3731176#.ZElLBnbMKUl.
+
+### Codes
+Please note that many of the coding lines below are from Dr. Callahan's [DADA2 tutorial](https://benjjneb.github.io/dada2/tutorial.html).
+
+# Load libraries
+
+
+```{r, results = 'hide', warning=FALSE, message=FALSE}
+library(dada2)
+library(readr)
+library(stringr)
+library(dplyr)
+library(tibble)
+library(magrittr)
+library(phyloseq)
+library(ggplot2)
+library(fs)
+library(tidyr)
+library(ShortRead)
+library(Biostrings)
+library(tidyverse)
+library(vegan)
+library(decontam)
+library(pals)
+library(tools)
+library(seqTools)
+library(DT)
+```
+
+# Directories
+
+Note that the two different samples have different barcode schemes, and as such they were provided in two different folders. As the md5sum files are contained within each file, let's leave them separately for now. 
+
+```{r, results = 'hide', warning=FALSE, message=FALSE}
+rm(list=ls()) # clear environment 
+
+sto.dir = file.path("~/storage/data/") # Path to storage directory
+data.dir.LT = path.expand(file.path("~/storage/GLP_KO_Mice/Hu_8493_23072803")) #CHANGE ME to where files are stored
+data.dir.fecal = path.expand(file.path("~/storage/GLP_KO_Mice/Hu2_8493_23072803")) #CHANGE ME to where files are stored
+scratch.dir = path.expand(file.path(sto.dir, paste0("scratch")))
+output.dir = path.expand(file.path(sto.dir, paste0("output")))
+git.dir = file.path("~/GLP_KO_Microbiome/")
+if (dir_exists(scratch.dir)) {
+  dir_delete(scratch.dir)
+}
+dir_create(scratch.dir)
+if (dir_exists(output.dir)) {
+  dir_delete(output.dir)
+}
+dir_create(output.dir)
+filt.dir = path.expand(file.path(scratch.dir,paste0("filt")))
+cut.dir = path.expand(file.path(scratch.dir,paste0("cut"))) # Fecal files need cutadapt
+filtN.dir = path.expand(file.path(scratch.dir,paste0("filtN"))) # For removing N's before cutadapt
+
+md5sum.LT = file.path(data.dir.LT, paste0("Hu_8493_23072803.checksum")) # CHANGE ME to where checksum file is
+md5sum.fecal = file.path(data.dir.fecal, paste0("Hu2_8493_23072803.checksum"))  # CHANGE ME to where checksum file is
+
+map.file = file.path(git.dir, "20231011_Metadata_w_health_modified.csv")
+meta.df = read_csv(map.file)
+
+fecal.file = file.path(git.dir, "Fecal_submissions.csv")
+fecal.df = read_csv(fecal.file)
+
+Sys.setenv(OUT_DIR = output.dir)
+Sys.setenv(STO_DIR = sto.dir)
+Sys.setenv(SCRATCH_DIR = scratch.dir)
+Sys.setenv(DATA_DIR_LT = data.dir.LT)
+Sys.setenv(DATA_DIR_fecal = data.dir.fecal)
+Sys.setenv(MAP_FILE = map.file)
+Sys.setenv(FILT_DIR = filt.dir)
+Sys.setenv(CUT_DIR = cut.dir)
+Sys.setenv(FILTN_DIR = filtN.dir)
+
+# Ref database
+
+silva_v138.ref = "/hpc/home/yk132/storage/silva_ref/silva_v138/silva_nr99_v138.1_train_set.fa.gz"
+silva_v138.species.ref = "/hpc/home/yk132/storage/silva_ref/silva_v138/silva_species_assignment_v138.1.fa.gz"
+```
+
+
+# Check Metadata
+
+```{r}
+meta.df
+fecal.df
+```
+
+Note that the `meta.df` containing the health information do not contain the PCR and diluting water blanks for fecal samples. This was an oversight due to the metadata table for fecal samples being based on DNA extractions, and thus not including sequencing- and PCR-related blanks.Note that this is not true for the lung tissue samples, as DMC prepared them. Let's resolve this issue: 
+
+```{r}
+fecal.df %>% select(`Sample-Index`, `Concentration-(ng/uL)`) %>% 
+  dplyr::rename(Label = `Sample-Index`) %>% filter(!Label %in% meta.df$Label) -> missing.df
+```
+
+We will keep Label 30 for now, but this fecal sample will be dropped later (due to potential mislabeling).
+
+```{r}
+missing.df$Sample_type <- "Fecal"
+missing.df %>% mutate(
+  Type = case_when(
+    Label == "30" ~ "True Sample",
+    Label != "30" ~ "Neg Control"
+  )
+) -> missing.df
+
+missing.df$Sequencing_Run <- 2
+missing.df
+```
+
+```{r}
+dplyr::bind_rows(missing.df, meta.df) -> meta.df
+meta.df
+```
+
+```{r}
+write_csv(meta.df, file.path(git.dir, "Metadata_with_all_blanks.csv"), append = FALSE, col_names = TRUE)
+```
+
+Note that we only need the metadata file for Sequencing Run #2. 
+
+```{r}
+meta.df %>% filter(Sequencing_Run == 2) -> meta.df
+```
+
+
+# Data Provenance
+
+First, it is important to check the md5sums to ensure that the data was downloaded and stored correctly. 
+
+```{r}
+md5sum.LT %>%
+   read_delim(delim="   ", col_names = c("filename", "true_md5sum"), show_col_types = FALSE) -> true_md5sums
+
+data.dir.LT %>%
+  list.files(full.names = TRUE ) %>%
+  md5sum() %>%
+  enframe(name="filepath", value="observed_md5sum")   %>%  
+  mutate(filename=basename(filepath)) ->observed_md5sums
+
+true_md5sums %>% filter(filename %in% observed_md5sums$filename) %>%    # Since my reads are only a subset of full run, need to subset md5sums
+  full_join(observed_md5sums, by = "filename") %>%
+  mutate(md5sum_match = observed_md5sum == true_md5sum) %>%
+  filter(!str_detect(filename, "checksum|README")) -> compare_md5sums  # Path also contains README and checksum filesl; remove these
+
+all(compare_md5sums$md5sum_match)
+
+```
+
+```{r}
+md5sum.fecal %>%
+   read_delim(delim="   ", col_names = c("filename", "true_md5sum"), show_col_types = FALSE) -> true_md5sums
+
+data.dir.fecal %>%
+  list.files(full.names = TRUE ) %>%
+  md5sum() %>%
+  enframe(name="filepath", value="observed_md5sum")   %>%  
+  mutate(filename=basename(filepath)) ->observed_md5sums
+
+true_md5sums %>% filter(filename %in% observed_md5sums$filename) %>%    # Since my reads are only a subset of full run, need to subset md5sums
+  full_join(observed_md5sums, by = "filename") %>%
+  mutate(md5sum_match = observed_md5sum == true_md5sum) %>%
+  filter(!str_detect(filename, "checksum|README")) -> compare_md5sums  # Path also contains README and checksum files; remove these
+
+all(compare_md5sums$md5sum_match)
+
+```
+
+All files have the correct md5sums. 
+
+Note that the "Label" column matches the .fastq sample names. 
+
+
+# Remove Primers for the Fecal Samples
+
+Since I did not use heterogeneous spacers, I will use the `FilterAndTrim` function in DADA2 to remove primers. Please note that lung tissue samples do not require primer / barcode removal. 
+
+
+```{r}
+fnFs_F_Fecal <- sort(list.files(data.dir.fecal, pattern="_R1_001.fastq.gz", full.names = TRUE)) # fecal samples only! 
+fnRs_R_Fecal <- sort(list.files(data.dir.fecal, pattern="_R2_001.fastq.gz", full.names = TRUE))
+
+suffix2 = "/hpc/home/yk132/storage/GLP_KO_Mice/Hu2_8493_23072803/"
+end = "_S.*_L001_R1_001.fastq.gz"
+end2 = "_R1_001.fastq.gz"
+fnFs_F_Fecal %>%
+  basename %>%
+  str_replace(suffix2, "") %>%
+  str_replace(end, "")%>%
+  str_replace(end2, "") -> sample.names.fecal
+print(sample.names.fecal)
+```
+
+
+## Data Quality: Fecal Samples
+
+```{r}
+plotQualityProfile(fnFs_F_Fecal[c(1:10)], aggregate = T) # 10 fecal samples
+plotQualityProfile(fnRs_R_Fecal[c(1:10)], aggregate = T)
+```
+
+Checking to see presence of primers: 
+
+```{r}
+FWD <- "GTGYCAGCMGCCGCGGTAA"   # full primer seq TCGTCGGCAGCGTCAGATGTGTATAAGAGACAGGTGYCAGCMGCCGCGGTAA  515F
+REV <- "GGACTACNVGGGTWTCTAAT"  # full primre seq GTCTCGTGGGCTCGGAGATGTGTATAAGAGACAGGGACTACNVGGGTWTCTAAT 806rB
+
+allOrients <- function(primer) {
+    # Create all orientations of the input sequence
+    require(Biostrings)
+    dna <- DNAString(primer)  # The Biostrings works w/ DNAString objects rather than character vectors
+    orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna), 
+        RevComp = reverseComplement(dna))
+    return(sapply(orients, toString))  # Convert back to character vector
+}
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+FWD.orients
+
+primerHits <- function(primer, fn) {
+    # Counts number of reads in which the primer is found
+    nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+    return(sum(nhits > 0))
+}
+
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs_F_Fecal[[1]]), 
+    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs_R_Fecal[[1]]), 
+    REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs_F_Fecal[[1]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs_R_Fecal[[1]]))
+```
+
+The forward primer sequence is 19 bp long, and the reverse primer sequence is 20 bp long. 
+
+```{r}
+filtFs_Fecal <- file.path(filt.dir, "filtered", paste0(sample.names.fecal, "_F_filt.fastq.gz"))
+filtRs_Fecal <- file.path(filt.dir, "filtered", paste0(sample.names.fecal, "_R_filt.fastq.gz"))
+names(filtFs_Fecal) <- sample.names.fecal
+names(filtRs_Fecal) <- sample.names.fecal
+```
+
+
+```{r}
+filt.out_Fecal <- filterAndTrim(fnFs_F_Fecal, filtFs_Fecal, fnRs_R_Fecal, filtRs_Fecal, 
+                          trimLeft = 19, trimRight = 20, # remove primers
+                          maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE, 
+                          compress=TRUE, multithread=TRUE)
+
+filtFs.survived_Fecal <- sort(list.files(path.expand(file.path(filt.dir,paste0("filtered"))), pattern="_F_filt.fastq.gz", full.names = TRUE))
+filtRs.survived_Fecal <- sort(list.files(path.expand(file.path(filt.dir,paste0("filtered"))), pattern="_R_filt.fastq.gz", full.names = TRUE))
+
+suffix = "/hpc/home/yk132/storage/GLP_KO_Microbiome/scratch/filt/filtered"
+end = "_F_filt.fastq.gz"
+end2 = "_R_filt.fastq.gz"
+filtFs.survived_Fecal %>%
+  basename %>%
+  str_replace(suffix, "") %>%
+  str_replace(end, "")%>%
+  str_replace(end2, "") -> sample.names.filter.fecal
+
+sample.names.fecal[which(!sample.names.fecal %in% sample.names.filter.fecal)] # See which reads did not survive filter
+
+```
+
+Only blanks did not survive the filter and trimming step. 
+
+Check that primers are removed: 
+
+```{r}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = filtFs_Fecal[[1]]), 
+    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = filtRs_Fecal[[1]]), 
+    REV.ForwardReads = sapply(REV.orients, primerHits, fn = filtFs_Fecal[[1]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = filtRs_Fecal[[1]]))
+```
+
+And here is the data quality after trimming: 
+
+```{r}
+plotQualityProfile(filtFs_Fecal[c(1:10)], aggregate = T) # 10 fecal samples
+plotQualityProfile(filtRs_Fecal[c(1:10)], aggregate = T)
+```
+
+
+# DADA2
+
+The primers are already removed for the lung tissue samples, but it should still undergo the same filtering step (minus the trimming)
+
+```{r}
+fnFs <- sort(list.files(data.dir.LT, pattern="_R1_001.fastq.gz", full.names = TRUE)) # Lung Tissue only
+fnRs <- sort(list.files(data.dir.LT, pattern="_R2_001.fastq.gz", full.names = TRUE))
+```
+
+## Data Quality: Lung Tissue Samples
+```{r}
+plotQualityProfile(fnFs[c(1:10)], aggregate = T) # 10 LT samples
+plotQualityProfile(fnRs[c(1:10)], aggregate = T)
+```
+## Filter and Trim
+
+```{r}
+suffix2 = "/hpc/home/yk132/storage/GLP_KO_Mice/Hu_8493_23072803/" # CHANGE ME to directory
+end = "_S.*_L001_R1_001.fastq.gz"
+end2 = "_R1_001.fastq.gz"
+fnFs %>%
+  basename %>%
+  str_replace(suffix2, "") %>%
+  str_replace(end, "")%>%
+  str_replace(end2, "") -> sample.names # This is for lung tissue samples only 
+print(sample.names)
+```
+
+```{r}
+filtFs <- file.path(filt.dir, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt.dir, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+```{r}
+length(fnFs) 
+length(filtFs) # make sure the lengths match
+```
+
+```{r}
+filt.out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs,maxN=0, maxEE=c(2, 2), truncQ=2, rm.phix=TRUE,
+                          compress=TRUE, multithread=TRUE)  # Primer/barcode already removed so not setting truncation based on length
+                                                            # Otherwise same with fecal samples 
+```
+
+Let's see if all reads survived the filtering and trimming step: 
+
+```{r}
+filtFs.survived <- sort(list.files(path.expand(file.path(filt.dir,paste0("filtered"))), pattern="_F_filt.fastq.gz", full.names = TRUE))
+filtRs.survived <- sort(list.files(path.expand(file.path(filt.dir,paste0("filtered"))), pattern="_R_filt.fastq.gz", full.names = TRUE))
+
+suffix = "/hpc/home/yk132/storage/GLP_KO_Microbiome/scratch/filt/filtered"
+end = "_F_filt.fastq.gz"
+end2 = "_R_filt.fastq.gz"
+filtFs.survived %>%
+  basename %>%
+  str_replace(suffix, "") %>%
+  str_replace(end, "")%>%
+  str_replace(end2, "") -> sample.names.filter
+
+sample.names[which(!sample.names %in% sample.names.filter)] # See which reads did not survive filter
+```
+
+All lung tissue samples survived the filtering step. 
+
+
+## Error Correction
+
+Let's check that the list of files include both lung and fecal samples: 
+
+```{r}
+filtFs.survived 
+```
+
+```{r}
+errF <- learnErrors(filtFs.survived, multithread=TRUE)
+errR <- learnErrors(filtRs.survived, multithread=TRUE)
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+```
+
+
+## Dereplication
+
+```{r}
+derepFs <- derepFastq(filtFs.survived, verbose=TRUE)
+derepRs <- derepFastq(filtRs.survived, verbose=TRUE)
+```
+
+```{r}
+names(derepFs) <- sample.names.filter
+names(derepRs) <- sample.names.filter
+
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errF, multithread=TRUE)
+```
+
+## Merge Paired Reads
+
+```{r}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+```
+
+## Check: sequence lengths
+
+With the primers removed, the target amplicon region should be about 254 bp. Let's check: 
+
+```{r}
+seqtab <- makeSequenceTable(mergers)
+table(nchar(getSequences(seqtab)))
+```
+
+They indeed peak at the expected length. 
+Remove sequences that are unexpectedly long or short:
+
+```{r}
+seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% 250:256]
+```
+
+
+
+## Chimera Removal
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method="consensus", minFoldParentOverAbundance = 4, multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab2)
+```
+
+While there are a good number of bimeras, they accounted for less than 7% of the reads. 
+
+
+
+## Track reads through pipeline
+
+```{r, results = 'hide'}
+filt.out %>% rbind(filt.out_Fecal) -> filt.df
+filt.df %>% 
+  as.data.frame() %>% 
+  filter(reads.out != "0")  %>% rownames_to_column("Label") %>% mutate(Label = str_replace(Label, "_.*.fastq.gz", "")) -> filt.out.count
+filt.out.count[match(
+  sample.names.filter, filt.out.count$Label),] -> filt.out.count
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(filt.out.count$Label, filt.out.count$reads.in, filt.out.count$reads.out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+colnames(track) <- c("Label", "input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+track
+```
+
+
+```{r}
+track.df %>% 
+  select(-denoisedR) %>%
+  pivot_longer(
+  cols = c(input:nonchim), 
+  names_to = "stage",
+  values_to = "counts"
+)  %>%  mutate(stage=factor(stage, levels = c('input','filtered','denoisedF','merged','tabled','nonchim'))) -> track
+# track$Label <- str_replace(track$Label, "X", "")
+track %>% left_join(meta.df, by = "Label")-> track.graph
+
+track.graph$counts <- as.double(track.graph$counts)
+
+track.graph %>%
+  dplyr::filter(Sample_type == "Fecal") %>%
+    ggplot(mapping=aes(x=stage, y=counts, by=Label, group = Label)) +
+    geom_line(alpha=0.5) +
+        theme_classic()
+
+track.graph %>%
+  dplyr::filter(Sample_type == "Lung Tissue") %>%
+    ggplot(mapping=aes(x=stage, y=counts, by=Label, group = Label)) +
+    geom_line(alpha=0.5) +
+        theme_classic()
+```
+The large number of reads belong to the positive control. It doesn't look like we're losing a ridiculous number of reads from the samples. The relatively low number of reads in some fecal samples is concerning. 
+
+## Check Number of Samples
+
+```{r}
+meta.df %>% dim()
+dim(seqtab.nochim)
+```
+
+```{r}
+meta.df %>% filter(!Label %in% rownames(seqtab.nochim))
+```
+
+These two samples did not survive the filter and trimming step.
+
+## Assign taxonomy
+
+For plotting purposes, having ASV numbers (ex. ASV1-ASV999) is easier, but it's also useful to have the whole DNA sequences as the RefSeq object. 
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, silva_v138.ref, multithread=TRUE)
+# taxa <- addSpecies(taxa, silva_v138.species.ref) # identify species when possible  
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+```{r}
+meta.df %>% column_to_rownames("Label") -> meta.df # Change Label into rownames for passing off to phyloseq
+meta.df
+rownames(seqtab.nochim)
+all(rownames(seqtab.nochim) %in% rownames(meta.df))
+```
+
+All rownames match. 
+
+## Save and export as phyloseq object
+
+```{r}
+otus = otu_table(seqtab.nochim, taxa_are_rows=FALSE)
+sd = sample_data(meta.df)
+ps <- phyloseq(otus,
+               sd,
+               tax_table(taxa))
+```
+
+
+```{r}
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps))) # Give taxa ASV names for easier graphing 
+ps
+```
+
+```{r}
+ps@sam_data 
+ps@tax_table %>% head()
+```
+
+```{r}
+ps.rds = file.path(git.dir, paste0("Large_run_w_blanks.rds"))
+write_rds(ps, ps.rds)
+loaded.ps = read_rds(ps.rds)
+print(loaded.ps)
+```
+
+The phyloseq object was written and saved correctly. 
+
+# Reproducibility
+```{r}
+sessionInfo()
+```
+
