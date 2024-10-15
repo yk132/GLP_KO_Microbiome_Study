@@ -1,0 +1,2030 @@
+---
+title: '01: Host Health'
+author: "Eva Kim"
+output: 
+  html_document:
+    df_print: paged
+date: "`r format(Sys.time(), '%m/%d/%Y')`"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This R markdown file contains analysis for host health data. Non-technical outliers are removed if and only if they are extreme outliers (3 * interquartile range away from either end of box plot). 
+
+# Load libraries and directories
+
+```{r, results = 'hide', warning=FALSE, message=FALSE}
+rm(list = ls(all = TRUE))
+
+library(magrittr)
+library(fs)
+library(tidyverse)
+library(rstatix)
+library(ggpubr)
+library(pals)
+library(RColorBrewer)
+library(colorBlindness)
+library(ggrepel)
+library(DT)
+library(doBy)
+# install.packages("mvnormtest") ## install if necessary
+library(mvnormtest) 
+# install.packages("DescTools") # install if necessary
+library(DescTools) # calculate AUC
+library(lme4) # for linear mixed-effects model
+library(lmerTest)
+library(plotly)
+library(ggpubr)
+library(cowplot)
+library(ragg)
+```
+
+```{r}
+rm(list=ls()) # clear environment 
+git.dir = file.path("/hpc/group/dmc/Eva/GLP_KO_Microbiome_Study") # CHANGE ME
+fig.dir = file.path(git.dir, "figures")
+
+if (dir_exists(fig.dir)) {
+  dir_delete(fig.dir)
+}
+dir_create(fig.dir)
+
+map.file = file.path(git.dir, "Metadata_GLP1.csv")
+meta.df = read_csv(map.file, show_col_types = FALSE)
+
+glp_key.file = file.path(git.dir, "GLP1_KO_microbiome_key.csv")
+glp_key.df = read_csv(glp_key.file,col_names = TRUE, show_col_types = FALSE )
+
+diff.file = file.path(git.dir, "microbiome_cell_diff_counts_bal.csv")
+diff.df = read_csv(diff.file,col_names = TRUE, show_col_types = FALSE )
+
+protein.file = file.path(git.dir, "Proteins_import.csv")
+protein.df = read_csv(protein.file,col_names = TRUE, show_col_types = FALSE )
+
+trichrome.file = file.path(git.dir, "Trichrome_import.csv")
+trichrome.df = read_csv(trichrome.file,col_names = TRUE, show_col_types = FALSE )
+
+hist.file = file.path(git.dir, "histology_GLP_mice_import.csv")
+hist.df = read_csv(hist.file, show_col_types = FALSE)
+```
+# Check data frames
+
+```{r}
+meta.df %>% head()
+
+meta.df$Mouse <- factor(meta.df$Mouse)
+meta.df$Genotype <- factor(meta.df$Genotype, levels = c("WT", "KO"))
+meta.df$Sex <- factor(meta.df$Sex, levels = c("Female", "Male"))
+meta.df$Diet <- factor(meta.df$Diet, levels = c("Normal_Chow", "High_Fat_Diet"))
+meta.df$Intranasal_Treatment <- factor(meta.df$Intranasal_Treatment, levels = c("PBS", "HDM"))
+meta.df$Surgery <- factor(meta.df$Surgery, levels = c("None", "Sham", "VSG"))
+meta.df$Group <- factor(meta.df$Group, levels = c("1", "2"))
+
+meta.df %>% head()
+
+```
+
+```{r}
+meta.df %>% filter(Type == "True Sample") %>%
+  filter(is.na(Mouse) != TRUE) %>%
+  select(Mouse:Cage, Notes:Group) %>%
+  distinct(Mouse, `Cage-Mouse`, .keep_all = TRUE) -> meta.sam
+
+nrow(meta.sam)
+
+meta.sam %>%
+  select(Mouse, contains("Glucose")) %>%
+  pivot_longer(cols = contains("Glucose"),
+               names_to = c("Week", "Minute"),
+               names_pattern = "Glucose_tolerance_wk(\\d+)_(\\d+)m",
+               values_to = "Glucose_level"
+               ) -> Glucose.df
+
+Glucose.df %>% filter(is.na(Glucose_level) != TRUE) -> Glucose.df
+
+meta.sam %>%
+  select(Mouse, contains(c("Weight_g"))) %>%
+  pivot_longer(cols = contains("Weight"),
+               names_pattern = "Weight_g_wk(\\d+)",
+               names_to = "Week",
+               values_to = "Weight_g") -> Weight.df
+
+Weight.df %>% filter(is.na(Weight_g) != TRUE) -> Weight.df
+
+meta.df  %>% filter(Type == "True Sample") %>% 
+  select(Mouse, Genotype:Surgery, Cohort, Group) %>%
+  distinct() -> meta.factors
+
+Glucose.df %>% distinct(Mouse, Week, Minute, Glucose_level) -> Glucose.df
+Glucose.df %>% left_join(meta.factors, by = "Mouse") -> Glucose.graph
+
+Weight.df %>% distinct(Mouse, Week, Weight_g) -> Weight.df
+Weight.df %>% left_join(meta.factors, by = "Mouse") -> Weight.graph
+
+meta.sam %>%
+  select(Mouse, contains(c("Weight_g"))) %>% 
+  distinct(Mouse, Weight_g_wk0, Weight_g_wk10, Weight_g_wk13) %>%
+  left_join(meta.factors, by = "Mouse") -> weight.wide
+
+intersect(colnames(glp_key.df), colnames(meta.sam))
+glp_key.df %>% colnames()
+glp_key.df %>% select(c("Mouse Number", "Harvested at", "Genotype", "Sex")) %>%
+  dplyr::rename(Mouse = "Mouse Number") %>%
+  right_join(meta.sam, by = c("Mouse", "Genotype", "Sex")) %>%
+  dplyr::rename(Harvest_week = "Harvested at")-> meta.sam
+
+meta.sam$Harvest_week <- gsub("Week ", "", meta.sam$Harvest_week)
+meta.sam$Harvest_week <- as.numeric(meta.sam$Harvest_week)
+meta.sam %>% head()
+```
+
+```{r}
+meta.sam %>% 
+  dplyr::count(Intranasal_Treatment, Surgery, Diet) %>% arrange(n)
+```
+
+```{r}
+meta.sam %>% filter(Surgery == "None") %>% 
+  dplyr::count(Genotype, Diet, Intranasal_Treatment) %>% arrange(n)
+```
+
+
+# Effect of High Fat Diet (HFD)
+
+### Did mice on HFD gain weight? Check using no surgery mice
+
+```{r}
+Weight.graph %>% filter(Surgery == "None") -> Weight.nosurgery 
+Weight.nosurgery  %>% 
+  dplyr::count(Diet, Sex, Genotype, Week) %>% 
+  arrange(n)
+```
+
+```{r}
+# calculate number of mice included
+Weight.nosurgery  %>% distinct(Mouse) %>% nrow()
+
+Weight.nosurgery  %>% nrow()
+```
+
+Not enough *n* to test for all factors. Use Bonferroni-corrected alpha = 0.025 to test for genotype and sex separately.  
+
+None of the outliers are extreme; proceed. 
+
+```{r}
+Weight.nosurgery  %>% 
+  dplyr::count(Diet, Sex, Week) %>% 
+  arrange(n)
+```
+
+```{r}
+Weight.nosurgery  %>% 
+  dplyr::count(Diet, Genotype, Week) %>% 
+  arrange(n)
+```
+
+```{r}
+## Check normality
+### This is also Bonferroni-corrected alpha = 0.025
+Weight.nosurgery %>%
+  group_by(Diet, Genotype, Week) %>% 
+  filter(is.na(Mouse) == FALSE) %>%
+  shapiro_test(Weight_g)  %>%
+  add_significance()
+
+## Check outliers
+Weight.nosurgery %>%
+  group_by(Diet, Genotype, Week) %>% 
+  filter(is.na(Mouse) == FALSE) %>%
+  identify_outliers(Weight_g)
+```
+
+These sub-groups mostly not distinguishable from the normal distribution. Since none of the outliers are extreme and there are no notes to indicate that these outliers may be due to technical issues, include them in analysis. 
+
+```{r}
+## Check normality
+### This is also Bonferroni-corrected alpha = 0.025
+Weight.nosurgery %>%
+  group_by(Diet, Sex, Week) %>% 
+  filter(is.na(Mouse) == FALSE) %>%
+  shapiro_test(Weight_g)  %>%
+  add_significance()
+
+## Check outliers
+Weight.nosurgery %>%
+  group_by(Diet, Sex, Week) %>% 
+  filter(is.na(Mouse) == FALSE) %>%
+  identify_outliers(Weight_g)
+```
+
+```{r}
+Weight.nosurgery %>%
+  anova_test(dv = Weight_g,
+             wid = Mouse,
+             within = c(Week),
+             between = c(Diet, Sex)) %>%
+  get_anova_table() %>% as.data.frame() %>% as_tibble() %>% 
+  mutate(`p.adj` = case_when(p * 2 <= 1 ~ p*2,
+                             p * 2 > 1 ~ 1))  %>% 
+  add_significance()
+```
+
+Sex is highly significant, as is the three-way interaction between diet, sex, and week. 
+
+```{r}
+Weight.nosurgery %>%
+  anova_test(dv = Weight_g,
+             wid = Mouse,
+             within = Week,
+             between = c(Diet, Genotype)) %>%
+  get_anova_table() %>% as.data.frame() %>% as_tibble() %>% 
+  mutate(`p.adj` = case_when(p * 2 <= 1 ~ p*2,
+                             p * 2 > 1 ~ 1))  %>% 
+  add_significance()
+```
+
+Genotype is not significant and neither are interaction terms with genotype. Continue with breaking down the three-way interaction between diet, sex, and week. 
+
+```{r}
+Weight.nosurgery %>%
+  group_by(Sex) %>% 
+  anova_test(dv = Weight_g,
+             wid = Mouse,
+             within = c(Week),
+             between = c(Diet)) %>%
+  get_anova_table()
+```
+
+Let's break down diet: 
+
+```{r}
+Weight.nosurgery %>%
+  group_by(Sex, Diet) %>% 
+  tukey_hsd(Weight_g ~ Week) %>% dplyr::select(-c(`null.value`:`conf.high`))
+```
+
+Weeks 0, 10 and wks 0, 13 different for all diet * sex groups, and none significant for wks 10 and 13. 
+
+And main effect of diet: 
+
+```{r}
+Weight.nosurgery %>%
+  group_by(Week) %>% 
+  t_test(Weight_g ~ Diet) %>%
+  add_significance()
+```
+
+
+```{r}
+Weight.nosurgery %>%
+  group_by(Sex, Week) %>% 
+  t_test(Weight_g ~ Diet) %>%
+  add_significance()
+```
+
+Let's break down the interaction term. I want to check if the weight gain between weeks are significant between weeks. This is a paired t-test, and I will only focus on wks 0 and 10 (significant difference). 
+
+```{r}
+weight.wide %>% filter(Surgery == "None") %>%
+  mutate(Weight_diff_wk10_wk0 = Weight_g_wk10 - Weight_g_wk0) %>% 
+  filter(is.na(Weight_diff_wk10_wk0) != TRUE) %>% 
+  group_by(Diet) %>% 
+  t_test(Weight_diff_wk10_wk0 ~ Sex, paired = FALSE) %>%
+  add_significance()
+```
+
+
+```{r}
+# plot mean +/- standard error
+fun_se <- function(x){
+  c(std_error = sd(x)/sqrt(length(x)), mean = mean(x))
+}
+
+# calculate mean and se for each week, sex, and diet
+Weight.nosurgery %>%
+  doBy::summary_by(Weight_g ~ Week + Sex + Diet, FUN = fun_se) -> Weight.group1
+
+# merge se & mean with graph table 
+Weight.nosurgery %>% 
+  left_join(Weight.group1, by = c("Week", "Sex", "Diet")) %>%
+  mutate(Week = as.numeric(Week))   -> Weight.graph.nosurgery
+
+# compare diet for each week, stratified to sex
+Weight.graph.nosurgery %>% group_by(Sex, Week) %>% 
+  t_test(Weight_g ~ Diet) %>% adjust_pvalue(method = "holm") %>%
+  add_significance() %>%
+  mutate(y.position = 50)
+```
+
+
+Because week is a continuous variable, it's very hard to get R to cooperate with adding stars without changing Week to a factor. Add stars manually:
+
+```{r, fig.width=7, fig.height=5}
+# Effect of diet by sex, no surgery (Group 1)
+ggplot(Weight.graph.nosurgery, aes(x = Week, y = Weight_g.mean, color = Diet))+
+  geom_line(aes(group=Diet)) + 
+  geom_errorbar(aes(ymin=Weight_g.mean-Weight_g.std_error, ymax=Weight_g.mean+Weight_g.std_error, width=1)) +
+  theme_bw(base_size = 14) + scale_fill_brewer(palette="RdBu") + 
+  facet_wrap(~Sex) + labs(y="Weight (g)", x="Week")  + ylim(0,50) -> fig.weight.group1
+
+fig.weight.group1
+
+```
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_weight_group1.jpeg"), width = 7, height = 5, units = "in", res = 600, scaling = 1.2)
+fig.weight.group1
+dev.off()
+```
+
+### Did bariatric surgery result in weight loss in mice fed HFD? 
+
+```{r}
+Weight.graph %>%
+  filter(Week == "10" | Week == "13") %>%
+  filter(Diet == "High_Fat_Diet") %>%
+  dplyr::count(Week, Surgery, Sex) %>% arrange(n)
+```
+
+```{r}
+Weight.graph %>%
+  filter(Week == "10" | Week == "13") %>%
+  filter(Diet == "High_Fat_Diet") %>%
+  distinct(Mouse) %>% nrow()
+```
+
+```{r}
+## Test normality
+Weight.graph %>%
+  filter(Week == "10" | Week == "13") %>%
+  filter(Diet == "High_Fat_Diet") %>%
+  group_by(Week, Surgery, Sex) %>% 
+  shapiro_test(Weight_g) %>% 
+  add_significance()  
+
+## Get outliers
+Weight.graph %>%
+  filter(Week == "10" | Week == "13") %>%
+  filter(Diet == "High_Fat_Diet") %>%
+  group_by(Week, Surgery, Sex) %>% 
+  identify_outliers(Weight_g) 
+```
+
+Again, none are extreme. Proceed: 
+
+```{r}
+Weight.graph %>%
+  filter(Week == "10" | Week == "13") %>%
+  filter(Diet == "High_Fat_Diet") %>%
+  anova_test(dv = Weight_g,
+             wid = Mouse,
+             within = Week,
+             between = c(Surgery, Sex)) 
+```
+
+There is a three-way interaction between Surgery:Sex:Week and sex is highly significant. This indicates the possibility of sex differences. Let's stratify analysis within each sex: 
+
+```{r}
+Weight.graph %>%
+  filter(Week == "10" | Week == "13") %>%
+  filter(Diet == "High_Fat_Diet") %>%
+  group_by(Sex) %>% 
+  anova_test(dv = Weight_g,
+             wid = Mouse,
+             within = Week,
+             between = c(Surgery)) 
+```
+
+Only in male mice was there a significant interaction of surgery:week. 
+
+```{r}
+weight.wide$Weight_diff_wk13_wk10 <- weight.wide$Weight_g_wk13 - weight.wide$Weight_g_wk10
+
+weight.wide %>%
+  filter(is.na(Weight_diff_wk13_wk10) == FALSE & Diet == "High_Fat_Diet") %>%
+  dplyr::count(Sex, Surgery) 
+```
+
+```{r}
+weight.wide %>%
+  filter(Diet == "High_Fat_Diet" & Sex == "Male") %>%
+  tukey_hsd(Weight_diff_wk13_wk10 ~ Surgery, paired = FALSE, p.adjust.method = "holm") -> weight.wide.male
+weight.wide.male$Sex <- "Male"
+weight.wide.male
+```
+
+The weight difference is significant between None & Sham and between None and VSG, but not between Sham and VSG. However, this is only true for the male mice.
+
+```{r}
+weight.wide %>%
+  filter(Diet == "High_Fat_Diet" & Sex == "Female") %>%
+  tukey_hsd(Weight_diff_wk13_wk10 ~ Surgery, paired = FALSE, p.adjust.method = "holm") -> weight.wide.female
+weight.wide.female$Sex <- "Female"
+weight.wide.female
+```
+
+```{r}
+rbind(weight.wide.female, weight.wide.male) %>%
+  mutate(Sex = factor(Sex, levels = c("Female", "Male")))  %>% add_y_position() -> weight.13.10
+
+weight.13.10
+```
+
+
+```{r}
+my_comparisons <- list( c("None", "Sham"), c("Sham", "VSG"), c("None", "VSG") )
+
+## adjust y.position to avoid ns overlap 
+weight.13.10$y.position <- c("5", "6", "4", "6", "7", "5")
+
+weight.13.10$y.position <- as.numeric(weight.13.10$y.position)
+
+# title = "Weight difference from weeks 10 to 14 based on sex and surgery, Mice on  HFD"
+weight.wide %>%
+  filter(Diet == "High_Fat_Diet" & is.na(Weight_diff_wk13_wk10) != TRUE) %>%
+  ggplot(aes(x = Surgery, y = Weight_diff_wk13_wk10, color = Surgery)) +  
+  scale_fill_brewer(palette="RdBu")  + 
+  # scale_color_brewer(palette = "RdBu") +
+  geom_boxplot(position=position_dodge(width = 0.2)) +
+  geom_point(position=position_dodge(width = 0.2)) + 
+  labs(x="Surgery", y="Weight difference between weeks 10, 13 (g)") + 
+  facet_wrap(~Sex) +
+  theme_bw(base_size = 14) + stat_pvalue_manual(weight.13.10, label = "p.adj.signif", tip.length = 0.01) -> fig.diff.sex
+
+fig.diff.sex
+```
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_weight_sex_surgery.jpeg"), width = 7, height = 5, units = "in", res = 600, scaling = 1.2)
+fig.diff.sex
+dev.off()
+```
+
+
+# Glucose tolerance 
+
+```{r}
+Glucose.df %>% group_by(Mouse, Week) %>%
+  distinct(Mouse, Week) -> track.df
+
+track.df$AUC <- NA
+track.df$MaxPeak <- NA
+
+
+for (i in 1:length(track.df$Mouse)) {
+  Glucose.df %>% filter(Mouse == track.df$Mouse[i] & Week == track.df$Week[i]) -> tmp
+  AUC(as.numeric(tmp$Minute), tmp$Glucose_level) -> track.df$AUC[i]
+}
+
+for (i in 1:length(track.df$Mouse)) {
+  Glucose.df %>% filter(Mouse == track.df$Mouse[i] & Week == track.df$Week[i] & Minute != 0) %>%
+  select(Glucose_level) %>% max() -> tmp
+  tmp -> track.df$MaxPeak[i]
+}
+
+Glucose.df %>% filter(Minute == "0") %>%
+  select(-Minute) %>%
+  dplyr::rename(Glucose_min_0 = Glucose_level) -> Glucose.zeroes
+
+nrow(track.df) 
+nrow(Glucose.zeroes)
+left_join(track.df, Glucose.zeroes, by = c("Week", "Mouse")) -> track.df
+nrow(track.df)
+```
+
+
+```{r}
+track.df %>%
+  mutate(AUC_norm = AUC / sd(track.df$AUC),
+         MaxPeak_norm = MaxPeak / sd(track.df$MaxPeak),
+         Glucose_min_0_norm = Glucose_min_0 / sd(track.df$Glucose_min_0)) -> track.df
+```
+
+```{r}
+meta.sam %>% select(Mouse, Genotype:Surgery, Group) %>% right_join(track.df, by = "Mouse") -> Glucose.calc
+
+Glucose.calc %>% pivot_longer(
+  cols = "AUC_norm":"Glucose_min_0_norm",
+  values_to = "value",
+  names_to = "Measurement"
+) -> Glucose.stat
+
+Glucose.calc %>% pivot_longer(
+  cols = "AUC":"Glucose_min_0",
+  values_to = "value",
+  names_to = "Measurement"
+) -> Glucose.stat.raw
+```
+
+
+### Glucose calculations: no surgery group, effect of diet and sex? 
+
+Since there were sex effects in weight, I am more interested in sex than genotype. 
+
+```{r}
+Glucose.calc %>% filter(Surgery == "None")  %>% 
+  dplyr::count(Diet, Week, Sex) %>% arrange(n)
+``` 
+
+
+```{r}
+Glucose.calc %>% filter(Surgery == "None") %>% distinct(Mouse) %>% nrow()
+```
+
+
+For normality, we are looking within each measurement: 
+
+```{r}
+Glucose.stat.raw %>% filter(Surgery == "None")  %>% 
+  group_by(Diet, Week, Sex, Measurement) %>% shapiro_test(value) %>%
+  add_significance() 
+```
+
+Mostly indistinguishable from normal distribution. Continue. 
+
+Let's identify outliers:
+
+```{r}
+Glucose.stat.raw %>% filter(Surgery == "None") %>% 
+  group_by(Week, Diet, Sex, Measurement) %>% 
+  identify_outliers(value) 
+```
+
+```{r}
+Glucose.stat %>% filter(Surgery == "None") %>% 
+  group_by(Week, Diet, Sex, Measurement) %>% 
+  identify_outliers(value) %>% filter(`is.extreme` == TRUE) -> Glucose.nosurgery.extreme
+
+Glucose.nosurgery.extreme
+```
+
+
+```{r}
+Glucose.stat.raw %>% filter(Surgery == "None") %>% 
+  ggplot(aes(x = as.character(Week), y = value, color = Diet)) +
+  geom_boxplot() + 
+  theme_bw(base_size=14) + scale_fill_brewer(palette="RdBu") +
+  labs(y= element_blank(), x="Week") +
+  facet_grid(vars(Measurement), vars(Sex), scales = "free_y") + 
+  expand_limits(y = 0)
+```
+
+The extreme outliers are removed. 
+
+
+```{r}
+Glucose.stat %>% filter(Surgery == "None")  %>% 
+  dplyr::left_join(select(Glucose.nosurgery.extreme, c("Week", "Measurement", "Mouse", "is.extreme")),
+                   by = c("Week", "Measurement", "Mouse")) %>% 
+  dplyr::filter(is.na(is.extreme) == TRUE) -> Glucose.stat.nosurgery.noextreme
+
+nrow(Glucose.stat %>% filter(Surgery == "None"))
+nrow(Glucose.stat.nosurgery.noextreme) / 3 # since there are three measurements, this gives # tests 
+Glucose.stat.nosurgery.noextreme %>% distinct(Mouse) %>% nrow()
+```
+
+```{r}
+Glucose.stat.nosurgery.noextreme %>% 
+  dplyr::count(Diet, Week, Sex, Measurement) %>% arrange(n)
+```
+
+```{r}
+Glucose.stat.nosurgery.noextreme %>% 
+  anova_test(dv = value,
+    within = c(Measurement, Week),
+    wid = Mouse,
+    between = c(Diet, Sex)) %>% 
+  get_anova_table() %>% as_tibble() %>% 
+  mutate(`p.adj` = case_when(p * 2 <= 1 ~ p*2,
+                             p * 2 > 1 ~ 1))  %>% 
+  add_significance()
+```
+
+Diet, Sex, Measurement, Week are significant; three-way interaction term between Diet:Sex:Week. The four-way interaction is not significant with Bonferroni correction; however, it's still p < 0.10, and merits post-hoc analysis. 
+
+```{r}
+Glucose.nosurgery.extreme %>% 
+  mutate(Measurement = str_replace(Measurement, "_norm", "")) -> Glucose.stat.nosurgery.extreme.merge
+
+# data frame with raw values (=not normalized) with extreme outliers removed
+Glucose.stat.raw %>% filter(Surgery == "None") %>% 
+  dplyr::left_join(select(Glucose.stat.nosurgery.extreme.merge, c("Week", "Measurement", "Mouse", "is.extreme")),
+                   by = c("Week", "Measurement", "Mouse"))%>% 
+  dplyr::filter(is.na(is.extreme) == TRUE) -> Glucose.raw.nosurgery.noextreme
+```
+
+```{r}
+Glucose.raw.nosurgery.noextreme %>% 
+  group_by(Measurement) %>% 
+  anova_test(
+    dv = value,
+    within = c(Week),
+    wid = Mouse,
+    between = c(Diet, Sex))  %>% get_anova_table() 
+```
+
+Diet * Sex * Week significant for AUC only! For which diet was there a sex effect and for which week? And all three measurements had Sex:Week. Break down AUC:
+
+```{r}
+Glucose.raw.nosurgery.noextreme %>% filter(Surgery == "None" & Measurement == "AUC") %>% # use raw values since grouping by measurement
+  group_by(Measurement, Diet) %>% 
+  anova_test(
+    dv = value,
+    within = c(Week),
+    wid = Mouse,
+    between = c(Sex))  %>% get_anova_table() 
+```
+
+And for the other two metrics, was there a sex effect? 
+
+```{r}
+Glucose.raw.nosurgery.noextreme %>% filter(Surgery == "None" & Measurement != "AUC") %>% # use raw values since grouping by measurement
+  group_by(Measurement) %>% 
+  anova_test(
+    dv = value,
+    within = c(Week),
+    wid = Mouse,
+    between = c(Sex))  %>% get_anova_table() 
+```
+
+None are significant. 
+
+Continue breaking down AUC: 
+
+```{r}
+Glucose.raw.nosurgery.noextreme %>% filter(Surgery == "None" & Measurement == "AUC" & Diet == "High_Fat_Diet") %>% # use raw values since grouping by measurement
+  group_by(Measurement, Sex, Diet) %>% 
+  tukey_hsd(value ~ Week) %>% select(Sex:group2, `p.adj`, `p.adj.signif`) -> tukey.nosurgery.noextreme
+
+tukey.nosurgery.noextreme
+```
+
+```{r}
+tukey.nosurgery.noextreme %>% add_xy_position()-> tukey.nosurgery.noextreme
+Glucose.raw.nosurgery.noextreme %>% filter(Surgery == "None" & Measurement == "AUC" & Diet == "High_Fat_Diet") %>% 
+  ggplot(aes(x = Week, y = value)) +  
+  scale_fill_brewer(palette="RdBu")  + 
+  # scale_color_brewer(palette = "RdBu") +
+  geom_boxplot(position=position_dodge(width = 0.2)) + 
+  geom_point(position=position_dodge(width = 0.2)) + 
+  labs(x="Week", y="Area Under the Curve (mg·minute/dl)") + 
+  facet_wrap(vars(Sex)) +
+  theme_bw(base_size = 14) + stat_pvalue_manual(tukey.nosurgery.noextreme, label = "p.adj.signif", tip.length = 0.01) -> fig.glucose.nosurgery.AUC
+
+fig.glucose.nosurgery.AUC
+```
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_auc_sex_nosurgery.jpeg"), width = 7, height = 5, units = "in", res = 600, scaling = 1.2)
+fig.glucose.nosurgery.AUC
+dev.off()
+```
+
+Diet was highly significant for all three, as expected. Let's also break down the main effect of diet:
+
+```{r}
+Glucose.raw.nosurgery.noextreme %>%
+  filter(Group == 1) %>%
+  group_by(Measurement) %>%
+    anova_test(
+    dv = value,
+    within = c(Week),
+    wid = Mouse,
+    between = c(Diet)
+  ) %>% get_anova_table() %>%
+  filter(p < 0.05)
+```
+
+Very highly significant. What weeks are different? 
+Note that this is protected by ANOVA above and thus does not require multiple testing correction. 
+
+```{r}
+Glucose.raw.nosurgery.noextreme %>%
+  filter(Group == 1) %>%
+  group_by(Measurement, Week) %>%
+  t_test(value ~ Diet) %>%
+  add_significance() -> Glucose.group1.diet.comparison
+
+Glucose.group1.diet.comparison
+```
+
+```{r}
+Glucose.raw.nosurgery.noextreme %>%
+  filter(Group == 1 & Measurement == "AUC") %>%
+  dplyr::count(Measurement, Week, Diet) %>%
+  arrange(n)
+```
+
+
+```{r}
+Glucose.raw.nosurgery.noextreme  %>% 
+  doBy::summary_by(value ~ Diet + Measurement + Week,
+                   FUN = fun_se) -> Glucose.graph.raw.diet 
+
+Glucose.graph.raw.diet$Week <- as.numeric(Glucose.graph.raw.diet$Week)
+```
+
+Diet is significant for all three values at weeks 10 and 12.  
+
+```{r}
+Glucose.raw.nosurgery.noextreme %>% 
+  left_join(mutate(Glucose.graph.raw.diet, Week = as.character(Week)), by = c("Week", "Diet", "Measurement")) -> glucose.group1.graph
+```
+
+
+```{r}
+# Change facet label names
+measurement.labs <- c("Area Under the Curve (mg·minute/dl)", "Baseline glucose (mg/dl)", "Max. Peak (mg/dl)")
+names(measurement.labs) <- c("AUC", "Glucose_min_0", "MaxPeak")
+
+# title="No surgery group, Glucose tolerance testing results"
+ggplot(glucose.group1.graph, aes(x = as.numeric(Week), y = value.mean, group = Diet, color = Diet))+
+  geom_line() + theme_bw(base_size = 14) + scale_fill_brewer(palette="RdBu") +
+  geom_errorbar(aes(ymin=value.mean-value.std_error, ymax=value.mean+value.std_error), width=1.5) +
+  labs(y= element_blank(), x="Week") +
+  facet_wrap(~Measurement, scales = "free_y", 
+             labeller = labeller(Measurement = measurement.labs), strip.position = "left") + 
+  expand_limits(y = 0) + theme(strip.background = element_blank(), strip.placement = "outside",
+                               strip.text = element_text(size = 14)) -> fig.glucose.group1
+
+fig.glucose.group1
+```
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_glucose_group1.jpeg"), width = 8, height = 5, units = "in", res = 600, scaling = 1.2)
+fig.glucose.group1
+dev.off()
+```
+
+
+### Glucose calculations: no surgery group, effect of diet and genotype? 
+
+```{r}
+Glucose.calc %>% filter(Surgery == "None")  %>% 
+  dplyr::count(Diet, Week, Genotype) %>% arrange(n)
+```
+
+
+```{r}
+Glucose.stat.raw %>% filter(Surgery == "None")  %>% 
+  group_by(Diet, Week, Genotype, Measurement) %>% shapiro_test(value) %>%
+  add_significance() 
+```
+
+Mostly indistinguishable from normal distribution. Continue. 
+
+Let's identify outliers:
+
+```{r}
+Glucose.stat.raw %>% filter(Surgery == "None") %>% 
+  group_by(Week, Diet, Genotype, Measurement) %>% 
+  identify_outliers(value) 
+```
+
+```{r}
+Glucose.stat %>% filter(Surgery == "None") %>% 
+  group_by(Week, Diet, Genotype, Measurement) %>% 
+  identify_outliers(value) %>% filter(is.extreme == TRUE) -> Glucose.nosurgery.extreme.genotype
+
+Glucose.stat.raw %>% filter(Surgery == "None") %>% 
+  ggplot(aes(x = as.character(Week), y = value, color = Diet)) +
+  geom_boxplot() + 
+  theme_bw(base_size=14) + scale_fill_brewer(palette="RdBu") +
+  labs(y= element_blank(), x="Week") +
+  facet_grid(vars(Measurement), vars(Genotype), scales = "free_y") + 
+  expand_limits(y = 0)
+```
+
+Remove two extreme outliers. 
+
+```{r}
+Glucose.stat %>% filter(Surgery == "None")  %>% 
+  dplyr::left_join(select(Glucose.nosurgery.extreme.genotype, c("Week", "Measurement", "Mouse", "is.extreme")),
+                   by = c("Week", "Measurement", "Mouse")) %>% 
+  dplyr::filter(is.na(is.extreme) == TRUE) -> Glucose.stat.nosurgery.noextreme.genotype
+```
+
+```{r}
+Glucose.stat.nosurgery.noextreme.genotype %>% 
+  dplyr::count(Diet, Week, Genotype, Measurement) %>% arrange(n)
+
+Glucose.stat.nosurgery.noextreme.genotype %>% distinct(Mouse) %>% nrow()
+```
+
+```{r}
+Glucose.stat.nosurgery.noextreme.genotype %>% 
+  anova_test(dv = value,
+    within = c(Measurement, Week),
+    wid = Mouse,
+    between = c(Diet, Genotype)) %>% 
+  get_anova_table() %>% as_tibble() %>% 
+  mutate(`p.adj` = case_when(p * 2 <= 1 ~ p*2,
+                             p * 2 > 1 ~ 1))  %>% 
+  add_significance()
+```
+
+No significant four-way interaction or effect of genotype or its interactions.
+
+### HFD: Effect of surgery?  
+
+For effect of surgery, we can simply look at the post-operative wk 12. We do not have enough mice to look at sex or genotype. 
+
+```{r}
+Glucose.calc %>%
+  filter(Diet == "High_Fat_Diet" & Week == 12) %>%
+  dplyr::count(Surgery)
+
+Glucose.calc %>%
+  filter(Diet == "High_Fat_Diet" & Week == 12) %>%
+  dplyr::count(Surgery, Sex) %>% arrange(n)
+
+Glucose.calc %>%
+  filter(Diet == "High_Fat_Diet"& Week == 12) %>%
+  dplyr::count(Surgery, Genotype) %>% arrange(n)
+```
+
+
+```{r}
+# check normality
+Glucose.stat %>%
+  filter(Diet == "High_Fat_Diet" & Week == 12) %>%
+  group_by(Surgery, Measurement) %>% shapiro_test(value) %>%
+  add_significance() 
+
+# check outliers
+Glucose.stat %>%
+  filter(Diet == "High_Fat_Diet"  & Week == 12) %>%
+  group_by(Surgery, Measurement) %>% identify_outliers(value)
+```
+
+There are no extreme outliers; proceed. 
+
+```{r}
+Glucose.stat %>%
+  filter(Diet == "High_Fat_Diet"  & Week == 12)  %>%
+  anova_test(
+    dv = value,
+    within = c(Measurement),
+    wid = Mouse,
+    between = c(Surgery)
+  ) %>%
+  get_anova_table()
+```
+
+Effect of surgery but not genotype. 
+Let's see for which value surgery differed:  
+
+```{r}
+Glucose.stat.raw %>%
+  filter(Diet == "High_Fat_Diet" & Week == 12) %>%
+  group_by(Measurement) %>%
+  anova_test(
+    dv = value,
+    between = Surgery
+  ) %>% get_anova_table()
+```
+
+Surgery was significant for all three. 
+
+
+```{r}
+Glucose.stat.raw %>%
+  filter(Diet == "High_Fat_Diet" & Week == 12) %>%
+  group_by(Measurement) %>%
+  tukey_hsd(value ~ Surgery, paired = FALSE, p.adjust.method = "holm") %>%
+  add_significance() -> glucose_tukey
+
+glucose_tukey
+```
+
+
+```{r}
+# fix y.position values: order is none-sham, none-vsg, sham-vsg
+glucose_tukey$y.position <- c("40000","42000","38000",
+                                 "320","340","300",
+                                 "500","530","470")
+glucose_tukey$y.position <- as.numeric(glucose_tukey$y.position)
+
+measurement.labs <- c("Area Under the Curve (mg·minute/dl)", "Baseline glucose (mg/dl)", "Max. Peak (mg/dl)")
+names(measurement.labs) <- c("AUC", "Glucose_min_0", "MaxPeak")
+
+# title="HFD only by surgery:  Week 12"
+ggplot(subset(Glucose.stat.raw, Diet =="High_Fat_Diet" & Week == "12"), aes(x = Surgery, y = value, color = Surgery))+
+  geom_boxplot(position=position_dodge(width = 0.2)) + 
+  geom_point(position=position_dodge(width = 0.2)) + 
+  theme_bw(base_size = 14) + scale_fill_brewer(palette="RdBu") +
+  labs(y= element_blank(), x="Surgery") +
+  expand_limits(y = 0) + 
+  facet_wrap(~Measurement, scales = "free_y", labeller = labeller(Measurement = measurement.labs), strip.position = "left") + 
+  stat_pvalue_manual(glucose_tukey, label = "p.adj.signif", tip.length = 0.01) +
+  theme(strip.background = element_blank(), strip.placement = "outside",
+        strip.text = element_text(size = 14)) -> fig.glucose.surgery
+
+fig.glucose.surgery
+```
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_glucose_surgery.jpeg"), width = 12, height = 6, units = "in", res = 600, scaling = 1.2)
+fig.glucose.surgery
+dev.off()
+```
+
+```{r, fig.height=9, fig.width=14}
+plot_grid(
+  fig.weight.group1, fig.diff.sex,
+  fig.glucose.group1, fig.glucose.surgery,
+  labels = "AUTO", ncol = 2, label_size = 20, scale = 0.95
+) 
+
+```
+
+```{r, fig.height=9, fig.width=15}
+plot_grid(
+  fig.weight.group1, fig.glucose.group1,
+  fig.diff.sex, fig.glucose.surgery,
+  labels = "AUTO", ncol = 2, label_size = 20, scale = 0.93,
+  rel_widths = c(0.9, 1.2)
+) -> fig.weight.glucose.summary
+fig.weight.glucose.summary
+```
+
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_weight_glucose_summary.jpeg"), width = 15, height = 9, units = "in", res = 600, scaling = 1.2)
+fig.weight.glucose.summary
+dev.off()
+```
+
+
+# Serum metabolic markers
+
+```{r}
+protein.df %>% dplyr::rename(
+  C_peptide_pg_ml = `C-Peptide_pg_ml`,
+  GLP1_pM = `GLP-1_pM`,
+  Insulin_uIU_ml = `Insulin_uIU/ml`
+)  -> protein.df 
+```
+
+```{r}
+sapply(protein.df, function(x) sum(length(which(is.na(x))))) %>%
+  data.frame()
+```
+
+Only C-peptide and insulin have NA values. The NA values are from `#DIV/0!` error in Excel, which indicates that values were out of the detection range. For the case of insulin, it was not diluted enough and values were too high. In case of C-peptide, the values were too low. This is typical is C-peptide can be difficult to detect. Let's drop any columns where all values are `NA` and add metadata. 
+
+```{r}
+nrow(protein.df)
+```
+
+```{r}
+protein.df %>%
+  purrr::discard(~all(is.na(.))) %>%
+  dplyr::rename(Mouse = Sample) %>% 
+  left_join(meta.sam, by = "Mouse") %>%
+  dplyr::select(Mouse:PYY_pg_ml, Genotype, Sex, Diet:Surgery, Group) -> protein.meta
+
+protein.meta
+```
+
+
+```{r}
+protein.meta %>% filter(Surgery == "None") %>% 
+  dplyr::count(Diet, Genotype)
+
+protein.meta %>% filter(Diet == "High_Fat_Diet") %>% 
+  dplyr::count(Surgery)
+
+protein.meta %>% filter(Diet == "High_Fat_Diet") %>% 
+  dplyr::count(Surgery, Genotype)
+```
+
+```{r}
+protein.meta %>% mutate(
+  C_peptide_norm = C_peptide_pg_ml / sd(protein.meta$C_peptide_pg_ml,na.rm=TRUE),
+  Ghrelin_norm = Ghrelin_pg_ml / sd(protein.meta$Ghrelin_pg_ml,na.rm=TRUE),
+  GLP1_norm = GLP1_pM / sd(protein.meta$GLP1_pM,na.rm=TRUE),
+  Insulin_norm = Insulin_uIU_ml / sd(protein.meta$Insulin_uIU_ml,na.rm=TRUE),
+  Leptin_norm = Leptin_pg_ml / sd(protein.meta$Leptin_pg_ml,na.rm=TRUE),
+  PYY_norm = PYY_pg_ml / sd(protein.meta$PYY_pg_ml,na.rm=TRUE)
+) %>%
+  select(Mouse, contains("norm"), Genotype:Group)-> protein.norm
+
+tail(protein.norm)
+```
+
+Per usual, our questions are twofold:
+  1) Group 1, no surgery mice: effect of diet on these values. Then exclude insulin to test for the effect of diet and sex. 
+  2) Group 2, surgery mice: effect of surgery on these values. 
+  
+### Metabolic markers, no surgery mice: effect of diet? 
+
+```{r}
+protein.meta  %>% 
+  pivot_longer(
+    cols = -c(Mouse, Genotype:Group),
+    values_to = "value",
+    names_to = "Measurement"
+  ) %>% 
+  filter(is.na(value) != TRUE)-> protein.meta.long
+```
+
+```{r}
+protein.meta.long %>% dplyr::count(Measurement)
+```
+
+
+```{r}
+protein.meta.long %>% filter(Group == 1) %>%
+  dplyr::count(Measurement, Diet, Sex) %>% arrange(n)
+```
+
+```{r}
+protein.meta.long %>% filter(Group == 1) %>% distinct(Mouse)
+```
+
+Not enough n for insulin only. Let's just do diet: 
+
+```{r}
+protein.meta.long %>% filter(Group == 1) %>%
+  dplyr::count(Measurement, Diet) %>% arrange(n)
+```
+
+
+```{r}
+protein.meta.long %>% filter(Surgery == "None") %>% 
+  group_by(Measurement, Diet) %>%
+  shapiro_test(value) %>%
+  add_significance()
+```
+
+Mostly indistinguishable from normal distribution. 
+
+```{r}
+protein.meta.long %>% filter(Surgery == "None") %>% 
+  group_by(Measurement, Diet)  %>% 
+  identify_outliers(value)
+```
+
+None of them are extreme and they are not all from the same mouse. Proceed: 
+
+```{r}
+protein.norm %>% 
+  pivot_longer(
+    cols = contains("norm"),
+    values_to = "value",
+    names_to = "Measurement"
+  ) %>%
+  filter(is.na(value) == FALSE)   -> protein.norm.long
+```
+
+
+
+```{r}
+protein.norm.long %>% filter(Group == 1) %>% # use normalized values!!
+  anova_test(
+    dv = value,
+    wid = Mouse,
+    within = Measurement,
+    between = c("Diet")) %>%
+  get_anova_table() %>% as_tibble() %>% 
+  mutate(`p.adj` = case_when(p * 2 <= 1 ~ p*2,
+                             p * 2 > 1 ~ 1))  %>% 
+  add_significance()
+```
+Let's see for which measurement diet may have had an impact. Since there is only two levels in Diet, the post-hoc is essentially a t-test. 
+
+```{r}
+protein.meta.long %>% filter(Group == 1) %>% # grouping by measurement, use RAW values
+  group_by(Measurement) %>% 
+  t_test(value~ Diet) %>% 
+  # adjust_pvalue(method = "holm") %>% 
+  add_significance() -> protein.group1.res
+
+protein.group1.res
+```
+
+
+```{r, fig.height = 7, fig.width=15}
+# protein.meta.res$y.position <- c(8000, 35, 1300, 100000)
+protein.labs <- c("Ghrelin (pg/ml)", "GLP-1 (pM)", "Leptin (pg/ml)", "C-peptide (pg/ml)", "Insulin (uIU/ml)", "PYY (pg/ml)")
+names(protein.labs) <- c("Ghrelin_pg_ml", "GLP1_pM", "Leptin_pg_ml", "C_peptide_pg_ml", "Insulin_uIU_ml", "PYY_pg_ml")
+Diet.labs <- c("Normal\nChow", "High Fat\nDiet" )
+
+protein.meta.long %>% filter(Group == 1) %>%
+  ggplot(aes(x = Diet, y = value, color = Diet)) +
+  geom_boxplot() + geom_point() + expand_limits(y = 0) +
+  facet_wrap(~Measurement, scales = "free", ncol = 6,
+             labeller = labeller(Measurement = protein.labs), strip.position = "left") + 
+  theme_bw(base_size=14) + theme(strip.background = element_blank(), strip.placement = "outside",
+                                  legend.position = "top") + 
+  labs(y = element_blank(), x = "Diet") + scale_x_discrete(labels= Diet.labs) + 
+  stat_compare_means(method = "t.test", aes(label = after_stat(p.signif)), label.x = 1.5, tip.length = 0.01, 
+                     comparisons = list(c("Normal_Chow", "High_Fat_Diet"))) -> fig.protein.group1
+
+fig.protein.group1
+```
+
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_protein_group1.jpeg"), width = 15, height = 7, units = "in", res = 600, scaling = 1.2)
+fig.protein.group1
+dev.off()
+```
+
+### Metabolic markers, no surgery mice: effect of diet and sex? 
+
+```{r}
+protein.norm.long %>% filter(Group == 1 & Measurement != "Insulin_norm") %>%
+  dplyr::count(Measurement, Diet, Sex) %>% arrange(n)
+```
+
+```{r}
+protein.norm.long %>% filter(Group == 1 & Measurement != "Insulin_norm") %>% 
+  distinct(Mouse) %>% nrow()
+```
+
+```{r}
+protein.norm.long %>% filter(Group == 1 & Measurement != "Insulin_norm") %>%
+  group_by(Measurement, Diet, Sex) %>%
+  shapiro_test(value)
+```
+
+
+```{r}
+protein.norm.long %>% filter(Surgery == "None" & Measurement != "Insulin_norm") %>% # use normalized values!!
+  anova_test(
+    dv = value,
+    wid = Mouse,
+    within = Measurement,
+    between = c("Diet", "Sex")) %>%
+  get_anova_table() %>% as_tibble() %>% 
+  mutate(`p.adj` = case_when(p * 2 <= 1 ~ p*2,
+                             p * 2 > 1 ~ 1))  %>% 
+  add_significance()-> protein.anova.noinsulin
+
+protein.anova.noinsulin
+```
+
+With correction, sex is not significant; however, interaction between diet, sex, and measurement are. Run a two-way ANOVA with diet and sex for each measurement:  
+
+```{r}
+protein.meta.long %>% filter(Surgery == "None" & Measurement != "Insulin_uIU_ml") %>% # grouping by measurement, use RAW values
+  group_by(Measurement) %>% 
+   anova_test(
+    dv = value,
+    between = c("Diet", "Sex")) %>%
+  get_anova_table()
+```
+
+Interaction between `Diet:Sex` and main effect of `Sex` are significant for ghrelin and leptin. 
+
+```{r}
+protein.meta.long %>% filter(Surgery == "None"& Measurement == "Leptin_pg_ml" | Measurement == "Ghrelin_pg_ml") %>%
+  group_by(Diet, Measurement) %>%
+  t_test(value ~ Sex) %>% 
+  add_significance()
+```
+
+```{r, fig.height=5, fig.width=8}
+protein.meta.long %>% filter(Surgery == "None" & Measurement == "Leptin_pg_ml")  %>% ggplot(aes(x = Sex, y = value)) +
+  geom_boxplot() + geom_point() + expand_limits(y = 0) +
+  facet_wrap(~Diet, scales = "free") + 
+  theme_bw(base_size=14) + 
+  labs(y = "Leptin (pg/ml)", x = "Sex") + 
+  stat_compare_means(method = "t.test", aes(label = after_stat(p.signif)), label.x = 1.5, tip.length = 0.01, 
+                     comparisons = list(c("Male", "Female"))) -> fig.group1.leptin.sex
+
+protein.meta.long %>% filter(Surgery == "None"& Measurement == "Ghrelin_pg_ml")  %>% ggplot(aes(x = Sex, y = value)) +
+  geom_boxplot() + geom_point() + expand_limits(y = 0) +
+  facet_wrap(~Diet, scales = "free") + 
+  theme_bw(base_size=14) + 
+  labs(y = "Ghrelin (pg/ml)", x = "Sex") + 
+  stat_compare_means(method = "t.test", aes(label = after_stat(p.signif)), label.x = 1.5, tip.length = 0.01, 
+                     comparisons = list(c("Male", "Female"))) -> fig.group1.ghrelin.sex
+
+plot_grid(fig.group1.leptin.sex, fig.group1.ghrelin.sex, labels = c("B", "C"), ncol = 2, label_size = 20, scale = 0.95) -> fig.group1.bottomrow
+
+fig.group1.bottomrow
+```
+
+
+```{r, fig.height=6, fig.width=14}
+fig.weight.group1 + theme(legend.position = "top") -> fig.weight.group1
+fig.glucose.group1 + theme(legend.position = "top") -> fig.glucose.group1
+plot_grid(
+  fig.weight.group1, fig.glucose.group1,
+  labels = c("A", "B"), ncol = 2, label_size = 20, scale = 0.95
+)  -> toprow
+
+toprow
+```
+
+```{r, fig.height = 12, fig.width=14}
+plot_grid(toprow,
+  fig.protein.group1,
+  ncol = 1, labels = c("", "C"), label_size = 20,
+  rel_heights = c(0.8, 0.7),
+  rel_widths = c(0.7, 1)
+) -> fig.group1.summary.weight.glucose
+fig.group1.summary.weight.glucose
+```
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_group1_weight_glucose_met_summary.jpeg"), width = 15, height = 12, units = "in", res = 600, scaling = 1.1)
+fig.group1.summary.weight.glucose
+dev.off()
+```
+
+### Metabolic markers: HFD, test for surgery and genotype
+
+```{r}
+protein.norm.long %>% filter(Diet == "High_Fat_Diet") %>%
+  dplyr::count(Measurement, Surgery) 
+```
+
+I can compare between the None and Sham surgery group, but not with VSG as there is a single sample in the group. Furthermore, I do not have enough values for insulin. 
+
+
+```{r}
+protein.meta %>% filter(Diet == "High_Fat_Diet" & Surgery != "VSG") %>%
+  dplyr::count(Surgery, Genotype) %>% arrange(n)
+```
+
+
+```{r}
+protein.norm.long %>% filter(Diet == "High_Fat_Diet" & Surgery != "VSG" & Measurement != "Insulin_norm") %>%
+  group_by(Measurement, Surgery, Genotype) %>%
+  shapiro_test(value) %>% 
+  add_significance()
+```
+
+```{r}
+protein.norm.long %>% filter(Diet == "High_Fat_Diet" & Surgery != "VSG" & Measurement != "Insulin_norm") %>%
+  group_by(Measurement, Surgery, Genotype) %>%
+  identify_outliers(value) 
+```
+
+
+```{r}
+protein.norm.long %>% filter(Diet == "High_Fat_Diet" & Surgery != "VSG" & Measurement != "Insulin_norm") %>%
+  anova_test(
+    dv = value,
+    wid = Mouse,
+    within = Measurement,
+    between = c(Surgery, Genotype)) %>%
+  get_anova_table()
+```
+
+Interesting--surgery is NS, yet genotype is, but there is no significant interaction between surgery and measurement. Let's break this down by looking at main effect of genotype across measurements:  
+
+```{r}
+protein.meta.long %>% filter(Diet == "High_Fat_Diet" & Surgery != "VSG"  & Measurement != "Insulin_uIU_ml") %>% # grouping by measurement, use RAW values
+  group_by(Measurement) %>% 
+  t_test(value ~ Genotype) %>%
+  # adjust_pvalue(method = "holm") %>%
+  add_significance()
+```
+
+
+```{r}
+protein.meta.long %>% 
+  filter(Diet == "High_Fat_Diet" & Surgery != "VSG"  & Measurement != "Insulin_uIU_ml") %>%
+  ggplot(aes(x = Genotype, y = value)) +
+  geom_boxplot() + geom_point() + expand_limits(y = 0) +
+  facet_wrap(~Measurement, scales = "free", ncol = 6) + 
+  theme_bw(base_size = 14) +  
+  labs(y = element_blank(), x = "Genotype") + 
+  stat_compare_means(method = "t.test", aes(label = after_stat(p.signif)), label.x = 1.5, tip.length = 0.01, 
+                     comparisons = list(c("WT", "KO")))
+```
+
+Very extreme outlier in ghrelin. It is identified as an extreme outlier: 
+
+```{r}
+protein.meta.long %>% 
+  filter(Diet == "High_Fat_Diet" & Surgery != "VSG"  & Measurement != "Insulin_uIU_ml") %>%
+  group_by(Genotype, Measurement) %>% 
+  identify_outliers(value) 
+```
+
+Remove extreme outlier.
+
+```{r}
+protein.meta.long %>% 
+  filter(Diet == "High_Fat_Diet" & Surgery != "VSG"  & Measurement != "Insulin_uIU_ml") %>% 
+  filter(value == 1232.81)
+```
+
+Only one entry matches that exact value, which is the extreme outlier. 
+
+```{r}
+protein.meta.long %>% 
+  filter(Diet == "High_Fat_Diet" & Surgery != "VSG"  & Measurement != "Insulin_uIU_ml") %>% 
+  filter(value != 1232.81) -> protein.meta.long.hfd.noextreme
+
+protein.meta.long.hfd.noextreme %>% 
+  dplyr::count(Measurement, Genotype) %>% arrange(n)
+```
+
+Re-run t-test with extreme outlier removed: 
+
+
+```{r}
+protein.meta.long.hfd.noextreme %>% 
+  group_by(Measurement) %>% 
+  t_test(value ~ Genotype) %>%
+  # adjust_pvalue(method = "holm") %>%
+  add_significance()
+```
+
+
+
+### Back to original path
+
+```{r, fig.height = 5, fig.width=15}
+protein.meta.long.hfd.noextreme %>% 
+  filter(Diet == "High_Fat_Diet" & Surgery != "VSG"  & Measurement != "Insulin_uIU_ml") %>%
+  ggplot(aes(x = Genotype, y = value)) +
+  geom_boxplot() + geom_point() + expand_limits(y = 0) +
+  facet_wrap(~Measurement, scales = "free", ncol = 6,
+             labeller = labeller(Measurement = protein.labs), strip.position = "left") + 
+  theme_bw(base_size = 14) + theme(strip.background = element_blank(), strip.placement = "outside",
+                     strip.text = element_text(size = 14)) + 
+  labs(y = element_blank(), x = "Genotype") + 
+  stat_compare_means(method = "t.test", aes(label = after_stat(p.signif)), label.x = 1.5, tip.length = 0.01, 
+                     comparisons = list(c("WT", "KO"))) -> fig.protein.hfd
+
+fig.protein.hfd
+```
+
+```{r, fig.height = 6, fig.width=12}
+protein.meta.long.hfd.noextreme$Genotype <- factor(protein.meta.long.hfd.noextreme$Genotype, levels = c("WT", "KO"))
+
+protein.meta.long.hfd.noextreme %>% 
+  filter(Diet == "High_Fat_Diet" & Surgery != "VSG"  & Measurement != "Insulin_uIU_ml") %>%
+  ggplot(aes(x = Genotype, y = value, color = Genotype)) +
+  geom_boxplot() + geom_point() + expand_limits(y = 0) +
+  facet_wrap(~Measurement, scales = "free", ncol = 6,
+             labeller = labeller(Measurement = protein.labs), strip.position = "left") + 
+  theme_bw(base_size = 14) + theme(strip.background = element_blank(), strip.placement = "outside",
+                     strip.text = element_text(size = 14), legend.position = "top") + 
+  labs(y = element_blank(), x = "Genotype") + 
+  stat_compare_means(method = "t.test", aes(label = after_stat(p.signif)), label.x = 1.5, tip.length = 0.01, 
+                     comparisons = list(c("WT", "KO"))) -> fig.protein.hfd
+
+fig.protein.hfd
+```
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_protein_hfd_genotype.jpeg"), width = 12, height = 6, units = "in", res = 600, scaling = 1.2)
+fig.protein.hfd
+dev.off()
+```
+
+```{r, fig.height=6, fig.width=14}
+fig.diff.sex + theme(legend.position = "top") -> fig.diff.sex
+fig.glucose.surgery + theme(legend.position = "top") -> fig.glucose.surgery
+
+plot_grid(
+  fig.diff.sex,  fig.glucose.surgery,
+  labels = "AUTO", ncol = 2, label_size = 20, scale = 0.95, 
+  rel_widths = c(0.7, 1)
+)  -> hfd.toprow
+
+hfd.toprow
+```
+
+```{r, fig.height=12, fig.width=14}
+plot_grid(hfd.toprow, fig.protein.hfd, ncol = 1, labels = c("", "C"), 
+          label_size = 20) -> fig.hfd.summary
+
+fig.hfd.summary
+```
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_hfd_summary.jpeg"), width = 14, height = 12, units = "in", res = 600, scaling = 1.2)
+fig.hfd.summary
+dev.off()
+```
+
+
+# Trichrome Area
+
+```{r}
+trichrome.df
+```
+
+This is a lot of data; the trichrome area was measured from 10 airways from each mouse. Victoria has already combed through the data and calculated the mean % trichrome area with outliers from each mouse removed. I will be using the mean % trichromne area. 
+
+```{r}
+trichrome.df %>% dplyr::select(Mouse, Mean_Percent_Trichrome_Area_outliers_removed) %>%
+  filter(is.na(Mean_Percent_Trichrome_Area_outliers_removed) == FALSE) %>% 
+  distinct(.keep_all = TRUE) %>%
+  left_join(dplyr::select(meta.sam, c(Mouse, Genotype, Sex, Diet:Surgery)), by = "Mouse") -> trichrome.mean
+
+trichrome.mean
+```
+
+```{r}
+trichrome.mean %>% filter(Surgery == "None") %>%
+  dplyr::count(Diet, Intranasal_Treatment)
+
+trichrome.mean %>% filter(Diet == "High_Fat_Diet") %>%
+  dplyr::count(Surgery, Intranasal_Treatment)
+
+trichrome.mean %>% filter(Diet == "High_Fat_Diet") %>%
+  dplyr::count(Intranasal_Treatment)
+```
+
+```{r}
+trichrome.mean %>% filter(Surgery == "None") %>%
+  group_by(Diet, Intranasal_Treatment) %>%
+  shapiro_test(Mean_Percent_Trichrome_Area_outliers_removed)  %>%
+  add_significance()
+
+trichrome.mean %>% filter(Diet == "High_Fat_Diet") %>%
+  group_by(Intranasal_Treatment) %>%
+  shapiro_test(Mean_Percent_Trichrome_Area_outliers_removed)  %>%
+  add_significance()
+```
+
+```{r}
+trichrome.mean %>% filter(Surgery == "None") %>% 
+  anova_test(dv = Mean_Percent_Trichrome_Area_outliers_removed,
+             between = c(Diet, Intranasal_Treatment)) %>%
+  get_anova_table()
+```
+
+
+```{r}
+trichrome.mean %>% filter(Surgery == "None") %>%
+  t_test(Mean_Percent_Trichrome_Area_outliers_removed ~ Intranasal_Treatment) 
+```
+
+```{r}
+# title: Mean trichrome area, outliers removed, no surgery group 
+
+trichrome.mean %>% filter(Surgery == "None") %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = Mean_Percent_Trichrome_Area_outliers_removed)) +
+  geom_boxplot() + geom_point() + expand_limits(y=0) +
+  theme_bw(base_size=14)  + 
+  labs(y = "Average % Trichrome Area", x = "Intranasal Treatment") +
+  stat_compare_means(aes(label = after_stat(p.signif)), method="t.test", label.x = 1.5, 
+                     comparisons = list(c("PBS", "HDM")), label.y = 17) -> fig.trichrome.nosurgery
+
+fig.trichrome.nosurgery
+```
+
+```{r}
+trichrome.mean %>% filter(Diet == "High_Fat_Diet") %>% 
+  t_test(Mean_Percent_Trichrome_Area_outliers_removed ~ Intranasal_Treatment)
+```
+
+```{r}
+# title: Mean trichrome area, outliers removed, HFD
+
+trichrome.mean %>% filter(Diet == "High_Fat_Diet") %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = Mean_Percent_Trichrome_Area_outliers_removed)) +
+  geom_boxplot() + geom_point() + expand_limits(y=0) +
+  theme_bw(base_size=14)  + 
+  labs(y = "Average % Trichrome Area", x = "Intranasal Treatment") +
+  stat_compare_means(aes(label = after_stat(p.signif)), method="t.test", label.x = 1.5, 
+                     comparisons = list(c("PBS", "HDM")), label.y = 17) -> fig.trichrome.hfd
+
+fig.trichrome.hfd
+```
+
+```{r}
+trichrome.mean %>% 
+  t_test(Mean_Percent_Trichrome_Area_outliers_removed ~ Intranasal_Treatment) 
+```
+
+
+```{r}
+# for all 
+trichrome.mean %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = Mean_Percent_Trichrome_Area_outliers_removed)) +
+  geom_boxplot() + geom_point() + expand_limits(y=0) +
+  theme_bw(base_size=14)  + 
+  labs(y = "Average % Trichrome Area", x = "Intranasal Treatment") +
+  stat_compare_means(aes(label = after_stat(p.signif)), method="t.test", label.x = 1.5, 
+                     comparisons = list(c("PBS", "HDM")), label.y = 17) -> fig.trichrome.all
+
+fig.trichrome.all
+```
+
+# Histology
+
+```{r}
+hist.df %>% dplyr::rename(Intranasal_Treatment = `Intranasal treatment`) %>% 
+  mutate(
+  Diet = case_when(Diet == "NC" ~ "Normal_Chow",
+                   Diet == "HFD" ~ "High_Fat_Diet"),
+  Surgery = str_replace(Surgery, "No", "None")) -> hist.clean
+hist.clean
+```
+
+```{r}
+hist.clean %>% pivot_longer(
+  cols = HE_score:PAS_score,
+  names_to = "Score_type",
+  values_to = "Score"
+) -> hist.graph
+
+hist.graph
+```
+
+Let's graph: 
+
+```{r}
+hist.graph %>% filter(Surgery == "None") %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = Score)) +
+  geom_boxplot() +  geom_point() +
+  labs(x="Intranasal treatment", y="Score", title = "Histology scores, No surgery") + 
+  theme_bw(base_size=14)+ expand_limits(y = 0) +
+  facet_grid(vars(Score_type), vars(Diet))
+
+hist.graph %>% filter(Surgery == "None") %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = Score)) +
+  geom_boxplot() +  geom_point() +
+  labs(x="Intranasal treatment", y="Score", title = "Histology scores, No surgery") + 
+  theme_bw(base_size=14)+ expand_limits(y = 0) +
+  facet_wrap(vars(Score_type))
+
+hist.graph %>% filter(Surgery == "None") %>% 
+  ggplot(aes(x = Diet, y = Score)) +
+  geom_boxplot() +  geom_point() +
+  labs(x="Diet", y="Score", title = "Histology scores, No surgery") + 
+  theme_bw(base_size=14)+ expand_limits(y = 0) +
+  facet_wrap(vars(Score_type))
+```
+
+```{r}
+hist.graph %>% filter(Diet == "High_Fat_Diet") %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = Score)) +
+  geom_boxplot() +  geom_point() +
+  labs(x="Intranasal treatment", y="Score", title = "Histology scores, HFD") + 
+  theme_bw(base_size=14)+ expand_limits(y = 0) +
+  facet_wrap(vars(Score_type))
+
+```
+
+It looks like only intranasal treatment will be significant for the no surgery group. 
+
+```{r}
+hist.clean %>% filter(Surgery == "None") %>% 
+  dplyr::count(Intranasal_Treatment)
+
+hist.clean %>% filter(Diet == "High_Fat_Diet") %>% 
+  dplyr::count(Surgery, Intranasal_Treatment)
+
+hist.clean %>% filter(Diet == "High_Fat_Diet") %>% 
+  dplyr::count(Intranasal_Treatment)
+```
+
+
+```{r}
+hist.graph %>% filter(Surgery == "None") %>% 
+  group_by(Intranasal_Treatment, Score_type) %>% 
+  shapiro_test(Score) %>%
+  add_significance()
+
+hist.graph %>% filter(Diet == "High_Fat_Diet") %>% 
+  group_by(Intranasal_Treatment, Score_type) %>% 
+  shapiro_test(Score) %>%
+  add_significance()
+
+```
+
+Is this due to outliers? 
+
+```{r}
+hist.graph %>% filter(Surgery == "None") %>% 
+  group_by(Intranasal_Treatment, Score_type) %>% 
+  identify_outliers(Score) 
+
+hist.graph %>% filter(Diet == "High_Fat_Diet") %>% 
+  group_by(Intranasal_Treatment, Score_type) %>% 
+  identify_outliers(Score) 
+```
+
+Again, the outliers refer to these graphs: 
+
+```{r}
+hist.graph %>% filter(Surgery == "None") %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = Score)) +
+  geom_boxplot() +  geom_point() +
+  labs(x="Intranasal treatment", y="Score", title = "Histology scores, No surgery") + 
+  theme_bw(base_size=14)+ expand_limits(y = 0) +
+  facet_wrap(vars(Score_type))
+
+hist.graph %>% filter(Diet == "High_Fat_Diet") %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = Score)) +
+  geom_boxplot() +  geom_point() +
+  labs(x="Intranasal treatment", y="Score", title = "Histology scores, HFD") + 
+  theme_bw(base_size=14)+ expand_limits(y = 0) +
+  facet_wrap(vars(Score_type))
+```
+
+It is because the PBS distribution is so tight for the PBS ones. I won't remove these outliers because those might be biological outliers. 
+Ignore and continue for now; the scores are on the same scale so there is no need to normalize.  
+
+```{r}
+hist.graph %>% filter(Surgery == "None") %>% 
+  anova_test(
+    dv = Score,
+    within = Score_type,
+    wid = Mouse,
+    between = c(Diet, Intranasal_Treatment)
+  ) 
+```
+
+Only intranasal treatment is significant. 
+
+```{r}
+hist.graph %>% filter(Surgery == "None") %>% 
+  group_by(Intranasal_Treatment, Score_type) %>% 
+  identify_outliers(Score) 
+```
+
+```{r}
+hist.graph %>% filter(Surgery == "None") %>% 
+  group_by(Score_type) %>% 
+  t_test(Score ~ Intranasal_Treatment) %>% 
+  add_significance()
+```
+
+```{r, fig.height=6, fig.width=6}
+hist.graph$Intranasal_Treatment <- factor(hist.graph$Intranasal_Treatment, levels = c("PBS", "HDM"))
+
+hist.labs <- c("HE Score", "PAS Score")
+names(hist.labs) <- c("HE_score", "PAS_score")
+
+# title = "Histology scores, No surgery, ~Intranasal Treatment"
+hist.graph %>% filter(Surgery == "None") %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = Score)) +
+  geom_boxplot() +  geom_point() +
+  labs(x="Intranasal treatment", y="Histology score") + 
+  theme_bw(base_size=14)+ expand_limits(y = 0) +
+  facet_wrap(~Score_type, labeller = labeller(Score_type = hist.labs)) +
+  stat_compare_means(method = "t.test", aes(label = after_stat(p.signif)), label.x = 1.5, tip.length = 0.01, 
+                     comparisons = list(c("HDM", "PBS")), label.y = 3) -> fig.hist.nosurgery
+
+fig.hist.nosurgery
+```
+
+
+Let's look at the HFD group: 
+
+```{r}
+hist.graph %>% filter(Diet == "High_Fat_Diet") %>% 
+  anova_test(
+    dv = Score,
+    within = Score_type,
+    wid = Mouse,
+    between = c(Intranasal_Treatment)
+  ) 
+```
+
+```{r}
+hist.graph %>% filter(Diet == "High_Fat_Diet") %>% 
+  group_by(Score_type) %>% 
+  t_test(Score ~ Intranasal_Treatment) %>% 
+  add_significance()
+```
+
+```{r, fig.height=6, fig.width=6}
+#title = "Histology scores, HFD, ~Intranasal Treatment"
+hist.graph %>% filter(Diet == "High_Fat_Diet") %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = Score)) +
+  geom_boxplot() +  geom_point() +
+  labs(x="Intranasal treatment", y="Histology score") + 
+  theme_bw(base_size=14)+ expand_limits(y = 0) +
+  facet_wrap(~Score_type, labeller = labeller(Score_type = hist.labs)) +
+  stat_compare_means(method = "t.test", aes(label = after_stat(p.signif)), label.x = 1.5, tip.length = 0.01, 
+                     comparisons = list(c("HDM", "PBS")), label.y = 3) -> fig.hist.hfd
+
+fig.hist.hfd
+```
+
+
+```{r}
+# just merge all samples 
+hist.graph %>% 
+  group_by(Score_type) %>% 
+  t_test(Score ~ Intranasal_Treatment) %>% 
+  add_significance()
+```
+
+```{r, fig.height=6, fig.width=6}
+# , title = "Histology scores, all, ~Intranasal Treatment"
+hist.graph %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = Score)) +
+  geom_boxplot() +  geom_point() +
+  labs(x="Intranasal treatment", y="Histology score") + 
+  theme_bw(base_size=14)+ expand_limits(y = 0) +
+  facet_wrap(~Score_type, labeller = labeller(Score_type = hist.labs)) +
+  stat_compare_means(method = "t.test", aes(label = after_stat(p.signif)), label.x = 1.5, tip.length = 0.01, 
+                     comparisons = list(c("HDM", "PBS")), label.y = 3) -> fig.hist.all
+
+fig.hist.all
+```
+
+```{r}
+#title = "Histology scores, HFD, ~Intranasal Treatment"
+hist.graph %>% filter(Diet == "High_Fat_Diet") %>% 
+  ggplot(aes(x = Surgery, y = Score, color = Surgery)) +
+  geom_boxplot() +  geom_point() +
+  labs(x="Surgery", y="Histology score") + 
+  theme_bw(base_size=14)+ expand_limits(y = 0) +
+  facet_grid(vars(Score_type), vars(Intranasal_Treatment), scales= "free_y",
+             labeller = labeller(Score_type = hist.labs)) 
+```
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_trichrome_all.jpeg"), width = 5, height = 8, units = "in", res = 600, scaling = 1.2)
+fig.trichrome.all
+dev.off()
+```
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_hist_all.jpeg"), width = 10, height = 8, units = "in", res = 600, scaling = 1.2)
+fig.hist.all
+dev.off()
+```
+
+
+# Differential immune cell counting data
+
+```{r}
+diff.df %>%
+  left_join(meta.sam, by = "Mouse") %>%
+  select(Mouse:Per_Epi, Genotype, Sex, Diet:Surgery) -> diff.meta
+
+diff.meta %>% filter(Surgery == "None") %>% 
+  dplyr::count(Intranasal_Treatment, Diet)
+
+diff.meta %>% filter(Diet == "High_Fat_Diet") %>% 
+  dplyr::count(Intranasal_Treatment, Surgery) 
+
+diff.meta %>% filter(Diet == "High_Fat_Diet") %>% 
+  dplyr::count(Intranasal_Treatment) 
+```
+
+Let's graph and see what we want to run tests on. 
+
+```{r}
+diff.meta %>% dplyr::count(Surgery)
+diff.meta %>% dplyr::count(Intranasal_Treatment)
+diff.meta %>% dplyr::count(Diet)
+```
+
+
+```{r,  fig.height = 4.5, fig.width=7}
+immune.labs <- c("% Eosinophils", "% Macrophages", "% Epithelial cells", "% Neutrophils", "% Lymphocytes")
+names(immune.labs) <- c("Per_Eos", "Per_Mac", "Per_Epi", "Per_Neut", "Per_Lym")
+
+diff.meta %>%
+  pivot_longer(cols = contains("Per"),
+               values_to = "value",
+               names_to = "Measurement") -> diff.long
+
+## Graphs for the no surgery group 
+diff.long %>% filter(Surgery == "None") %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = value)) +
+  geom_boxplot() + expand_limits(y = 0) + 
+  facet_wrap(~Measurement, scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14)   +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) + labs(y = "% of Total Cells")
+
+diff.long %>% filter(Surgery == "None") %>% 
+  ggplot(aes(x = Diet, y = value)) +
+  geom_boxplot() +  expand_limits(y = 0) + 
+  facet_wrap(~Measurement, scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14) +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) + labs(y = "% of Total Cells")
+
+
+diff.long %>% filter(Surgery == "None") %>% 
+  ggplot(aes(x = Genotype, y = value)) +
+  geom_boxplot() +  expand_limits(y = 0) + 
+  facet_wrap(~Measurement, scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14) +
+  labs(y = "% of Total Cells")
+```
+
+It looks like Intranasal treatment is the one that has most impact on the differential immune cell counting. 
+
+```{r}
+diff.long %>% filter(Surgery == "None") %>% 
+  group_by(Intranasal_Treatment, Measurement) %>%
+  shapiro_test(value) %>%
+  add_significance()
+```
+
+Many are not normally distributed. To be safe, let's just use Wilcoxon's rank sum test (nonparametric).  
+
+
+
+```{r}
+diff.long %>% filter(Surgery == "None")  -> diff.group1
+
+diff.group1 %>%
+  group_by(Measurement) %>% wilcox_test(value ~ Intranasal_Treatment) %>%
+  adjust_pvalue(method = "holm") %>%
+  add_significance() -> diff.res
+
+diff.res
+```
+
+
+```{r, fig.height=4, fig.width=8}
+## Graphs for the no surgery group 
+diff.res %>% mutate(y.position = c(70, 20, 3, 100, 20)) -> diff.res
+
+diff.group1 %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = value)) +
+  geom_boxplot() + geom_point() + 
+  facet_wrap(vars(Measurement), scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14) +
+  labs(y = "% of Total Cells", x = "Intranasal Treatment") + expand_limits(y=0) + 
+  stat_pvalue_manual(diff.res, label = "p.adj.signif", tip.length = 0.01)
+```
+
+I'm curious as to whether diet seems to affect this. 
+
+```{r, fig.height=4, fig.width=9}
+diff.group1 %>% 
+  ggplot(aes(x = Diet, y = value, color = Intranasal_Treatment)) +
+  geom_boxplot() + 
+  facet_wrap(vars(Measurement), scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14) +
+  labs(y = "% of Total Cells", x = "Diet") + expand_limits(y=0) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+Let's subset to the HDM group: 
+
+```{r}
+diff.group1 %>% filter(Intranasal_Treatment == "HDM") %>% 
+  group_by(Measurement) %>% wilcox_test(value ~ Diet) %>%
+  adjust_pvalue(method = "holm") %>%
+  add_significance() 
+```
+
+This is not significant. Is there a trend? 
+
+```{r, fig.height=5, fig.width=8}
+# No surgery, HDM only. Diet? 
+diff.group1 %>% filter(Intranasal_Treatment == "HDM") %>% 
+  ggplot(aes(x = Diet, y = value)) +
+  geom_boxplot() + geom_point() + 
+  facet_wrap(vars(Measurement), scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14) +
+  labs(y = "% of Total Cells", x = "Diet") + expand_limits(y=0) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+What about the HFD group? 
+
+```{r}
+# visualize HFD group 
+diff.long %>% filter(Diet == "High_Fat_Diet") %>% 
+  ggplot(aes(x = Surgery, y = value)) +
+  geom_boxplot() +  expand_limits(y = 0) + 
+  facet_wrap(~Measurement, scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14) +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) + labs(y = "% of Total Cells")
+
+diff.long %>% filter(Diet == "High_Fat_Diet") %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = value)) +
+  geom_boxplot() +  expand_limits(y = 0) + 
+  facet_wrap(~Measurement, scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14) +
+  labs(y = "% of Total Cells")
+
+diff.long %>% filter(Diet == "High_Fat_Diet") %>% 
+  ggplot(aes(x = Genotype, y = value)) +
+  geom_boxplot() +  expand_limits(y = 0) + 
+  facet_wrap(~Measurement, scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14) +
+  labs(y = "% of Total Cells")
+```
+
+```{r}
+diff.long %>% filter(Diet == "High_Fat_Diet")  -> diff.hfd
+
+diff.hfd %>%
+  group_by(Measurement) %>% wilcox_test(value ~ Intranasal_Treatment) %>%
+  adjust_pvalue(method = "holm") %>%
+  add_significance() -> diff.res.hfd
+
+diff.res.hfd
+```
+
+```{r, fig.height=4, fig.width=8}
+## Graphs for the no surgery group 
+diff.res.hfd %>% mutate(y.position = c(70, 15, 3, 100, 15)) -> diff.res.hfd
+
+diff.hfd %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = value)) +
+  geom_boxplot() + geom_point() + 
+  facet_wrap(vars(Measurement), scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14) +
+  labs(y = "% of Total Cells", x = "Intranasal Treatment") + expand_limits(y=0) + 
+  stat_pvalue_manual(diff.res.hfd, label = "p.adj.signif", tip.length = 0.01)
+```
+
+```{r, fig.height=4, fig.width=10}
+diff.hfd %>% 
+  ggplot(aes(x = Surgery, y = value, color = Intranasal_Treatment)) +
+  geom_boxplot() +  
+  facet_wrap(vars(Measurement), scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14) +
+  labs(y = "% of Total Cells", x = "Intranasal Treatment") + expand_limits(y=0) 
+```
+
+Subset to just HDM. 
+
+```{r}
+diff.meta %>% filter(Intranasal_Treatment == "HDM" & Diet == "High_Fat_Diet") %>%
+  dplyr::count(Surgery)
+```
+
+Can only plot. 
+
+```{r}
+diff.hfd %>% filter(Intranasal_Treatment == "HDM") %>% 
+  ggplot(aes(x = Surgery, y = value)) +
+  geom_boxplot() + geom_point() + 
+  facet_wrap(vars(Measurement), scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14) +
+  labs(y = "% of Total Cells", x = "Intranasal Treatment") + expand_limits(y=0) 
+```
+
+Let's just merge all, as the effect of intranasal treatment seems more significant than any other variable: 
+
+```{r}
+diff.long %>% 
+  group_by(Measurement) %>% wilcox_test(value ~ Intranasal_Treatment) %>%
+  adjust_pvalue(method = "holm") %>%
+  add_significance() -> diff.res.all
+
+diff.res.all
+```
+
+
+```{r, fig.height=4, fig.width=8}
+## Graphs for the no surgery group 
+diff.res.all %>% mutate(y.position = c(70, 15, 3, 100, 20)) -> diff.res.all
+
+diff.long %>% 
+  ggplot(aes(x = Intranasal_Treatment, y = value)) +
+  geom_boxplot() + geom_point() + 
+  facet_wrap(vars(Measurement), scales = "free_y", labeller = labeller(Measurement = immune.labs), ncol = 5) + theme_bw(base_size=14) +
+  labs(y = "% of Total Cells", x = "Intranasal Treatment") + expand_limits(y=0) + 
+  stat_pvalue_manual(diff.res.all, label = "p.adj.signif", tip.length = 0.01) -> fig.diff.all
+fig.diff.all
+```
+
+So for the % trichrome, histology scores, and differential immune cell counting, only intranasal treatment (and not other factors) seems to have an effect. 
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_diff_all.jpeg"), width = 9, height = 5, units = "in", res = 600)
+fig.diff.all
+dev.off()
+```
+
+```{r}
+plot_grid(
+  fig.trichrome.all, fig.hist.all,
+  labels = "AUTO", ncol = 2, label_size = 20, scale = 0.9, rel_widths = c(1, 2)
+) -> fig.intra
+
+fig.intra
+```
+
+```{r, fig.height=10, fig.width=8}
+plot_grid(
+  fig.intra, fig.diff.all, 
+  labels = c('', 'C'), label_size = 20, ncol = 1)
+```
+
+
+```{r, fig.height=5, fig.width=8}
+plot_grid(
+  fig.trichrome.all, fig.hist.all,
+  labels = c('B', 'C'), ncol = 2, label_size = 20, scale = 0.9, rel_widths = c(1, 2)
+) -> fig.intra
+
+fig.intra
+```
+
+```{r, fig.height=10, fig.width=8}
+plot_grid(fig.diff.all,
+  fig.intra, 
+  labels = c('A', ''), label_size = 20, ncol = 1) -> fig.intra.summary
+
+fig.intra.summary
+```
+
+```{r}
+ragg::agg_jpeg(file.path(fig.dir, "fig_int_trt_summary.jpeg"), width = 12, height = 12, units = "in", res = 600, scaling = 1.2)
+fig.intra.summary
+dev.off()
+```
+
+# Reproducibility
+```{r}
+sessionInfo()
+```
